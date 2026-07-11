@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Test (pytest)
+        run: pytest -q
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "## Backend coverage"
+            coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Coverage PR comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          marker="<!-- backend-coverage-report -->"
+          {
+            echo "$marker"
+            echo "## Backend coverage"
+            coverage report --format=markdown
+          } > coverage-comment.md
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | startswith(\"$marker\"))) | .[0].id // empty")
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@coverage-comment.md >/dev/null
+            echo "Updated coverage comment $id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@coverage-comment.md >/dev/null
+            echo "Created coverage comment"
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit deps (pip-audit)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pip-audit==2.7.3
+          echo "## Dependency audit (pip-audit)" >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          pip-audit -f markdown | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo ":white_check_mark: No known vulnerabilities found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Postgres + Kafka
+        run: docker compose up -d --wait postgres kafka
+      - name: Apply migrations
+        run: docker compose run --rm migrate
+      - name: Build service images
+        run: docker compose build worker dispatcher handler
+      - name: Start dispatcher + worker
+        run: docker compose up -d dispatcher worker
+      - name: Enqueue with a per-run override
+        id: enqueue
+        run: |
+          out=$(docker compose run --rm handler hello '{"name":"Grace","extra":true}')
+          echo "$out"
+          echo "$out" | grep -q 'enqueued hello as job'
+          echo "value=job enqueued" >> "$GITHUB_OUTPUT"
+      - name: Effective payload = base config merged with input (input wins)
+        id: merge
+        run: |
+          for i in $(seq 1 30); do
+            row=$(docker compose exec -T postgres psql -U app -d app -tAc \
+              "SELECT status||'|'||input_payload::text||'|'||payload::text FROM jobs WHERE job_type='hello' ORDER BY id DESC LIMIT 1")
+            echo "attempt $i: $row"
+            case "$row" in completed\|*) break;; esac
+            sleep 2
+          done
+          echo "$row" | grep -q '^completed|'
+          echo "$row" | grep -q '"name": "Grace"'
+          echo "$row" | grep -q '"extra": true'
+          echo "value=$row" >> "$GITHUB_OUTPUT"
+      - name: Kafka envelope is pointer-only (job_id + job_type, no business payload)
+        id: envelope
+        run: |
+          msg=$(docker compose exec -T kafka \
+            /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 --topic jobs \
+            --from-beginning --max-messages 1 --timeout-ms 20000)
+          echo "message: $msg"
+          echo "$msg" | grep -q '"job_id"'
+          echo "$msg" | grep -q '"job_type": "hello"'
+          if echo "$msg" | grep -q '"name"'; then echo "envelope leaked business payload"; exit 1; fi
+          echo "value=pointer envelope published" >> "$GITHUB_OUTPUT"
+      - name: Missing config fails the run gracefully
+        id: noconfig
+        run: |
+          docker compose run --rm handler ghost | grep -q 'enqueued ghost as job'
+          for i in $(seq 1 30); do
+            st=$(docker compose exec -T postgres psql -U app -d app -tAc \
+              "SELECT status FROM jobs WHERE job_type='ghost' ORDER BY id DESC LIMIT 1")
+            echo "attempt $i: ghost -> $st"
+            [ "$st" = "failed" ] && break
+            sleep 2
+          done
+          [ "$st" = "failed" ]
+          echo "value=ghost -> failed" >> "$GITHUB_OUTPUT"
+      - name: E2E summary
+        if: always()
+        run: |
+          {
+            echo "## End-to-end checks"
+            echo "| Check | Result | Value |"
+            echo "| --- | --- | --- |"
+            echo "| Enqueue \`hello\` w/ override | ${{ steps.enqueue.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.enqueue.outputs.value }}\` |"
+            echo "| Base⊕input effective payload | ${{ steps.merge.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.merge.outputs.value }}\` |"
+            echo "| Pointer-only Kafka envelope | ${{ steps.envelope.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.envelope.outputs.value }}\` |"
+            echo "| Missing config -> failed | ${{ steps.noconfig.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.noconfig.outputs.value }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

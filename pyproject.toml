@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["common", "handler", "dispatcher", "worker", "reaper"]
+omit = [
+    "*/__main__.py",
+    "common/db.py",
+    "common/messaging.py",
+    "common/migrate.py",
+    "tests/*",
+]
