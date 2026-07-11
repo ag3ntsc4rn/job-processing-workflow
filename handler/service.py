@@ -13,11 +13,13 @@ class EnqueueResult:
     enqueued: bool
 
 
-def enqueue(store: Store, job_type: str, payload: dict | None = None) -> EnqueueResult:
+def enqueue(store: Store, job_type: str) -> EnqueueResult:
     """Enqueue a job unless an active one of the same type already exists.
 
-    The dedup decision is made atomically by the store (partial unique index),
-    not by a read-then-write here, so concurrent handlers are safe.
+    The handler only names the ``job_type`` — no business data flows through it
+    (that lives in ``job_type_config`` and is snapshotted by the worker). The
+    dedup decision is made atomically by the store (partial unique index), not
+    by a read-then-write here, so concurrent handlers are safe.
     """
-    job_id = store.enqueue(job_type, payload or {})
+    job_id = store.enqueue(job_type)
     return EnqueueResult(job_id=job_id, enqueued=job_id is not None)

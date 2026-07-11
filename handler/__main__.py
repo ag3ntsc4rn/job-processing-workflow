@@ -1,15 +1,16 @@
 """CLI entrypoint standing in for an AutoSys trigger.
 
-    python -m handler <job_type> [payload_json]
+    python -m handler <job_type>
 
-Enqueues one job (or reports that an active one already exists). Any producer
-that can call ``handler.service.enqueue`` against the store is equivalent — the
-CLI is just the demo's stand-in for AutoSys.
+Enqueues one job (or reports that an active one already exists). The producer
+only names the job_type — the business payload lives in ``job_type_config`` and
+is snapshotted by the worker. Any producer that can call
+``handler.service.enqueue`` against the store is equivalent — the CLI is just
+the demo's stand-in for AutoSys.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 
 from common.config import Config
@@ -19,14 +20,13 @@ from handler.service import enqueue
 
 def main(argv: list[str]) -> int:
     if not argv:
-        sys.stderr.write("usage: python -m handler <job_type> [payload_json]\n")
+        sys.stderr.write("usage: python -m handler <job_type>\n")
         return 2
     job_type = argv[0]
-    payload = json.loads(argv[1]) if len(argv) > 1 else {}
 
     store = PostgresStore(Config.from_env().database_url)
     try:
-        result = enqueue(store, job_type, payload)
+        result = enqueue(store, job_type)
     finally:
         store.close()
 

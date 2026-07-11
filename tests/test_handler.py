@@ -5,7 +5,7 @@ from handler.service import enqueue
 
 def test_enqueue_creates_queued_job_and_outbox():
     store = InMemoryStore()
-    result = enqueue(store, "hello", {"name": "Ada"})
+    result = enqueue(store, "hello")
     assert result.enqueued is True
     job = store.get_job(result.job_id)
     assert job.status == JobStatus.QUEUED

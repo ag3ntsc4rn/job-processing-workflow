@@ -7,7 +7,7 @@ from handler.service import enqueue
 
 def test_dispatch_publishes_and_marks_dispatched():
     store = InMemoryStore()
-    job_id = enqueue(store, "hello", {"name": "Ada"}).job_id
+    job_id = enqueue(store, "hello").job_id
     producer = InMemoryProducer()
 
     sent = dispatch_once(store, producer, "jobs", batch_size=10)
@@ -16,7 +16,7 @@ def test_dispatch_publishes_and_marks_dispatched():
     topic, key, message = producer.published[0]
     assert topic == "jobs"
     assert key == str(job_id)
-    assert message == {"job_id": job_id, "job_type": "hello", "payload": {"name": "Ada"}}
+    assert message == {"job_id": job_id, "job_type": "hello"}
     assert store.get_job(job_id).status == JobStatus.DISPATCHED
 
 

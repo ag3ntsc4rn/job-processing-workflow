@@ -22,7 +22,7 @@ CREATE TABLE jobs (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_type    TEXT        NOT NULL,
     status      TEXT        NOT NULL DEFAULT 'queued',  -- queued|dispatched|running|completed|failed
-    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- snapshot of job_type_config.payload, taken by the worker at claim
     attempts    INT         NOT NULL DEFAULT 0,          -- times this run has been (re)dispatched; for churn cap (§7)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -35,11 +35,12 @@ CREATE UNIQUE INDEX jobs_one_active_per_type
     WHERE status IN ('queued', 'dispatched', 'running');
 ```
 
-Per-`job_type` config lives in a tiny lookup table (one row per type) so timeouts aren't hard-coded:
+Per-`job_type` config lives in a tiny lookup table (one row per type) — the business **payload** for the type plus its stuck-run timeout and churn cap — so none of it is hard-coded and producers never carry it:
 
 ```sql
 CREATE TABLE job_type_config (
     job_type      TEXT PRIMARY KEY,
+    payload       JSONB    NOT NULL DEFAULT '{}'::jsonb, -- the business inputs for this type (worker snapshots it at claim)
     run_timeout   INTERVAL NOT NULL DEFAULT '15 min',   -- how long a run may sit in 'running' before it's stuck
     max_attempts  INT      NOT NULL DEFAULT 3           -- reclaim cap before dead-letter (§7)
 );
@@ -47,13 +48,15 @@ CREATE TABLE job_type_config (
 
 > `attempts` here is **not** business retries (that's still Option A). It only counts how many times the *reaper* has re-dispatched a stuck run, so a poison job can't loop forever.
 
+> **Payload-as-config:** the business inputs live in `job_type_config.payload`, not in the message. Producers (AutoSys/handler) only *name* the `job_type`; the worker snapshots this payload into `jobs.payload` when it claims the run, so each run durably records the inputs it used even if the config later changes. A type with **no** config row is un-runnable — the worker fails such a run gracefully rather than leaving the dedup slot occupied.
+
 Plus a tiny **outbox** table so the handler never has to write to the DB and Kafka in the same breath (§3):
 
 ```sql
 CREATE TABLE outbox (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_id       BIGINT      NOT NULL REFERENCES jobs(id),
-    payload      JSONB       NOT NULL,          -- the Kafka message
+    payload      JSONB       NOT NULL,          -- envelope: {job_id, job_type}
     published_at TIMESTAMPTZ                    -- NULL until the dispatcher sends it
 );
 CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
@@ -76,7 +79,7 @@ This has a **race**: two AutoSys triggers (or two handler instances) both run th
 
 The **partial unique index** above makes the database enforce the rule. The handler just does:
 ```sql
-INSERT INTO jobs (job_type, payload) VALUES (?, ?)
+INSERT INTO jobs (job_type) VALUES (?)
 ON CONFLICT DO NOTHING;   -- 0 rows inserted = one is already active, so skip
 ```
 No SELECT, no race, correct no matter how many handlers run. **This is the whole point** — it's not extra machinery, it *replaces* your check-if-queued-or-running logic with one line the DB can't get wrong.
@@ -97,10 +100,10 @@ queued ──► running ──► completed
 **Handler** — one transaction, two inserts (the outbox row is what the dispatcher will send):
 ```sql
 BEGIN;
-  INSERT INTO jobs (job_type, payload) VALUES (?, ?)
+  INSERT INTO jobs (job_type) VALUES (?)
     ON CONFLICT DO NOTHING            -- 0 rows = already active, skip
     RETURNING id;
-  -- only if a row was inserted:
+  -- only if a row was inserted (outbox payload is the pointer envelope, no business data):
   INSERT INTO outbox (job_id, payload) VALUES (?, ?);
 COMMIT;
 ```
@@ -119,7 +122,7 @@ LIMIT 100;
 ```
 Crash before publish → row stays `published_at IS NULL` → retried next loop (at-least-once). Crash after publish but before the UPDATE → message re-sent → duplicate, absorbed by the worker guard in §6.
 
-**Worker** — consumes from Kafka, does the work, sets `completed` or `failed`.
+**Worker** — consumes from Kafka, claims the run, **snapshots `job_type_config.payload` into `jobs.payload`** (recording the inputs this run used; a type with no config row is failed gracefully), does the work, and sets `completed` or `failed`.
 
 ---
 
@@ -130,7 +133,7 @@ Crash before publish → row stays `published_at IS NULL` → retried next loop 
 - **Every run is its own row.** The partial unique index (§1) only blocks a *second active* row per `job_type` — it does **not** delete or reuse the old one. So each successful queue creates a new row, and completed/failed rows stay in the table forever. Over time `jobs` naturally accumulates one row per run per `job_type` — that *is* the run history.
 - **Timings come from the row itself.** `created_at` (queued), `updated_at` (last transition), and `status` tell you what happened to each run and roughly when. "Show me every `settlement` run this month and how each ended" is a single `SELECT ... WHERE job_type='settlement' ORDER BY created_at`.
 - **`jobs.id` is the run/correlation id.** It's auto-generated and unique per row = unique per run, so the worker just stamps `jobs.id` on every log line it ships to the SIEM. From any DB row you pivot straight to that run's full step-by-step timeline in the SIEM. No second table needed to link them.
-- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status IN ('queued','dispatched')`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required. (Accepting `queued` as well as `dispatched` matters: the dispatcher publishes to Kafka *before* it marks the row `dispatched`, so a fast worker can receive the message while the row is still `queued` — requiring only `dispatched` would strand it.)
+- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status IN ('queued','dispatched')`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required. Right after winning the claim, the worker snapshots `job_type_config.payload` into this row so the run records its inputs. (Accepting `queued` as well as `dispatched` matters: the dispatcher publishes to Kafka *before* it marks the row `dispatched`, so a fast worker can receive the message while the row is still `queued` — requiring only `dispatched` would strand it.)
 
 So the division of labor is dead simple: **`jobs`** = current state *and* durable per-run history (+ the run_id for SIEM), and **the SIEM** = the detailed step-by-step narrative. The `outbox` is the only other table.
 
@@ -238,14 +241,14 @@ Four deployable components + a shared contract library. The organizing principle
 
 Because `job_type` is data, three of the four components never change:
 
-- **handler** — `INSERT INTO jobs(job_type, payload)`; `job_type` is passed straight through, no `switch`.
+- **handler** — `INSERT INTO jobs(job_type)`; `job_type` is passed straight through, no `switch`, and it carries **no business payload** at all.
 - **dispatcher** — copies `outbox` bytes to Kafka; never inspects the payload.
 - **reaper** — acts on `status`/timeout; per-type timeouts come from the `job_type_config` **table**, not code.
 - **worker** — the *only* place type logic lives. A registry (like a `@register("my_type")` decorator) maps `job_type` → a handler class. New type = add one handler, register it, deploy the worker.
 
-The one non-code step is a `job_type_config` **row** (`run_timeout`, `max_attempts`) — a data insert, not a redeploy. Have the handler/reaper fall back to defaults when no row exists, so a new type runs on defaults and you only add a row to override them.
+The one non-code step is a `job_type_config` **row** (`payload`, `run_timeout`, `max_attempts`) — a data insert, not a redeploy. `run_timeout`/`max_attempts` fall back to defaults when absent, but the **payload** must be present: a type with no config row has no inputs to run, so the worker fails such a run gracefully.
 
-**Contract to hold the line:** every type shares one **message envelope** (`{job_id, job_type, payload}`) on one **topic**. As long as that's stable, the generic components never redeploy. A type needing a different envelope or its own topic/ordering is the only thing that would touch the dispatcher/contract — so agree on a stable envelope up front.
+**Contract to hold the line:** every type shares one **message envelope** (`{job_id, job_type}` — a pure pointer; the payload lives in `job_type_config`) on one **topic**. As long as that's stable, the generic components never redeploy. A type needing a different envelope or its own topic/ordering is the only thing that would touch the dispatcher/contract — so agree on a stable envelope up front.
 
 ---
 
@@ -261,7 +264,7 @@ CREATE TABLE jobs (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_type    TEXT        NOT NULL,
     status      TEXT        NOT NULL DEFAULT 'queued',  -- queued|dispatched|running|completed|failed
-    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- snapshot of job_type_config.payload, taken by the worker at claim
     attempts    INT         NOT NULL DEFAULT 0,          -- reaper re-dispatch count (churn cap), NOT business retries
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -281,14 +284,17 @@ CREATE INDEX jobs_type_created_idx ON jobs (job_type, created_at DESC);
 CREATE TABLE outbox (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_id       BIGINT      NOT NULL REFERENCES jobs(id),
-    payload      JSONB       NOT NULL,          -- the Kafka message: {job_id, job_type, payload}
+    payload      JSONB       NOT NULL,          -- the Kafka message envelope: {job_id, job_type}
     published_at TIMESTAMPTZ                    -- NULL until the dispatcher sends it
 );
 CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
 
--- Per-type tuning (timeouts / churn cap). Optional per row: fall back to defaults.
+-- Per-type config: the business payload (worker snapshots it at claim) plus
+-- stuck-run tuning. run_timeout/max_attempts fall back to defaults when absent;
+-- a type with no row is un-runnable (the worker fails the run gracefully).
 CREATE TABLE job_type_config (
     job_type      TEXT PRIMARY KEY,
+    payload       JSONB    NOT NULL DEFAULT '{}'::jsonb,
     run_timeout   INTERVAL NOT NULL DEFAULT '15 min',
     max_attempts  INT      NOT NULL DEFAULT 3
 );
@@ -299,15 +305,17 @@ CREATE TABLE job_type_config (
 ```sql
 BEGIN;
   -- dedup is enforced by the partial unique index; 0 rows back = already active, skip.
-  INSERT INTO jobs (job_type, payload)
-  VALUES (:job_type, :payload)
+  -- No business payload here: producers only name the job_type.
+  INSERT INTO jobs (job_type)
+  VALUES (:job_type)
   ON CONFLICT DO NOTHING
   RETURNING id;
 
   -- only if a row was inserted (use the RETURNING id):
+  -- outbox payload is the pointer envelope; no business data on the wire.
   INSERT INTO outbox (job_id, payload)
   VALUES (:job_id, jsonb_build_object(
-            'job_id', :job_id, 'job_type', :job_type, 'payload', :payload));
+            'job_id', :job_id, 'job_type', :job_type));
 COMMIT;
 ```
 
@@ -339,6 +347,14 @@ COMMIT;
 UPDATE jobs SET status = 'running', updated_at = now()
 WHERE id = :job_id AND status IN ('queued', 'dispatched');
 -- 0 rows affected => someone else owns it (or it's terminal) => ack & skip
+
+-- snapshot the type's configured payload into this run (records the inputs used).
+-- 0 rows => no job_type_config row for this type => fail the run gracefully.
+UPDATE jobs j
+SET payload = c.payload, updated_at = now()
+FROM job_type_config c
+WHERE j.id = :job_id AND c.job_type = j.job_type AND j.status = 'running'
+RETURNING j.payload;
 
 -- on success (then commit Kafka offset AFTER this commits):
 UPDATE jobs SET status = 'completed', updated_at = now()
@@ -397,4 +413,4 @@ WHERE j.status = 'running' AND j.updated_at < now() - c.run_timeout;
 
 ## Summary
 
-Four components (handler, dispatcher, worker, reaper) in separate repos + a shared contract lib, and just three tables: **`jobs`** (current state *and* durable per-run history, since rows accumulate one per run), a tiny **`outbox`**, and a small **`job_type_config`**. Two ideas do the heavy lifting: (1) the **partial unique index** that turns your queued-or-running check into something the database enforces atomically, and (2) the **outbox** so the handler writes the job and its Kafka message in one transaction and the dispatcher sends it reliably. Dedup, the worker claim guard, run history, and the SIEM correlation id all live on `jobs`. `job_type` is data everywhere except the worker, so **a new job type is a worker-only deploy**. Everything else is plain status transitions.
+Four components (handler, dispatcher, worker, reaper) in separate repos + a shared contract lib, and just three tables: **`jobs`** (current state *and* durable per-run history, since rows accumulate one per run), a tiny **`outbox`**, and a small **`job_type_config`** (which now also holds each type's business **payload**). Producers only name the `job_type`; the Kafka envelope is a pure pointer (`{job_id, job_type}`) and the worker snapshots the config payload into `jobs` at claim time (missing config → the run fails gracefully). Two ideas do the heavy lifting: (1) the **partial unique index** that turns your queued-or-running check into something the database enforces atomically, and (2) the **outbox** so the handler writes the job and its Kafka message in one transaction and the dispatcher sends it reliably. Dedup, the worker claim guard, run history, and the SIEM correlation id all live on `jobs`. `job_type` is data everywhere except the worker, so **a new job type is a worker-only deploy**. Everything else is plain status transitions.

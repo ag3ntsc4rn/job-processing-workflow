@@ -47,24 +47,24 @@ class PostgresStore:
         self._pool.close()
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str, payload: dict) -> int | None:
+    def enqueue(self, job_type: str) -> int | None:
         with self._pool.connection() as conn:
             with conn.transaction():
                 row = conn.execute(
                     """
-                    INSERT INTO jobs (job_type, payload)
-                    VALUES (%s, %s)
+                    INSERT INTO jobs (job_type)
+                    VALUES (%s)
                     ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
-                    (job_type, Jsonb(payload)),
+                    (job_type,),
                 ).fetchone()
                 if row is None:
                     return None  # an active job of this type already exists
                 job_id = int(row[0])
                 conn.execute(
                     "INSERT INTO outbox (job_id, payload) VALUES (%s, %s)",
-                    (job_id, Jsonb(build_envelope(job_id, job_type, payload))),
+                    (job_id, Jsonb(build_envelope(job_id, job_type))),
                 )
                 return job_id
 
@@ -107,6 +107,23 @@ class PostgresStore:
             "WHERE id=%s AND status IN ('queued', 'dispatched')",
             job_id,
         )
+
+    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
+        # Copy the type's configured payload into the claimed run, recording the
+        # exact inputs it ran with. Joins job_type_config, so a type with no
+        # config row yields no updated row -> None -> the worker fails it.
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE jobs j
+                SET payload = c.payload, updated_at = now()
+                FROM job_type_config c
+                WHERE j.id = %s AND c.job_type = %s AND j.status = 'running'
+                RETURNING j.payload
+                """,
+                (job_id, job_type),
+            ).fetchone()
+        return row[0] if row is not None else None
 
     def complete(self, job_id: int) -> bool:
         return self._guarded_update(

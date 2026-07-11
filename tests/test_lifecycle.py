@@ -26,18 +26,23 @@ def _drain_to_worker(store, producer, lookup):
 
 def test_happy_path_end_to_end():
     store = InMemoryStore()
+    store.set_type_config("hello", payload={"name": "Ada"})
     producer = InMemoryProducer()
 
-    job_id = enqueue(store, "hello", {"name": "Ada"}).job_id
+    job_id = enqueue(store, "hello").job_id
     outcomes = _drain_to_worker(store, producer, lambda _t: _ok)
 
     assert outcomes == ["completed"]
     assert store.get_job(job_id).status == JobStatus.COMPLETED
+    # the worker snapshotted the configured payload onto the run
+    assert store.get_job(job_id).payload == {"name": "Ada"}
 
 
 def test_stuck_run_recovers_and_completes_on_redispatch():
     store = InMemoryStore()
-    store.set_type_config("hello", run_timeout=timedelta(seconds=1), max_attempts=3)
+    store.set_type_config(
+        "hello", run_timeout=timedelta(seconds=1), max_attempts=3, payload={"name": "Ada"}
+    )
     producer = InMemoryProducer()
 
     job_id = enqueue(store, "hello").job_id

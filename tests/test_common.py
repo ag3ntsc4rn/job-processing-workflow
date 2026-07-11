@@ -3,11 +3,8 @@ from common.models import JobStatus, build_envelope
 
 
 def test_envelope_shape():
-    assert build_envelope(7, "hello", {"a": 1}) == {
-        "job_id": 7,
-        "job_type": "hello",
-        "payload": {"a": 1},
-    }
+    # Pure pointer: no business payload rides on the wire.
+    assert build_envelope(7, "hello") == {"job_id": 7, "job_type": "hello"}
 
 
 def test_active_and_terminal_states_are_disjoint():

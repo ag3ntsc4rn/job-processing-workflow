@@ -10,17 +10,21 @@ production implementation and mirrors these semantics exactly.
 from __future__ import annotations
 
 import itertools
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Protocol
+from typing import Any, Protocol
 
 from common.models import Job, JobStatus, OutboxMessage, StuckJob, build_envelope, utcnow
 
 
 class Store(Protocol):
     # --- handler ---
-    def enqueue(self, job_type: str, payload: dict) -> int | None:
+    def enqueue(self, job_type: str) -> int | None:
         """Insert a job + its outbox row in one transaction.
 
+        Only the ``job_type`` is named; the business payload lives in
+        ``job_type_config`` and is snapshotted by the worker at claim time.
         Returns the new job id, or ``None`` if an active job of this type
         already exists (dedup) so the caller should skip.
         """
@@ -32,7 +36,17 @@ class Store(Protocol):
 
     # --- worker ---
     def claim(self, job_id: int) -> bool:
-        """Compare-and-set ``dispatched -> running``. True iff this caller won."""
+        """Compare-and-set ``queued|dispatched -> running``. True iff caller won."""
+        ...
+
+    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
+        """Copy this type's ``job_type_config.payload`` into the claimed run.
+
+        Returns the snapshotted payload, or ``None`` if the type has no config
+        row (the run is then un-runnable and the worker fails it gracefully).
+        Records the exact inputs the run used, so ``jobs`` keeps durable
+        per-run history even though config can change between runs.
+        """
         ...
 
     def complete(self, job_id: int) -> bool: ...
@@ -58,6 +72,13 @@ DEFAULT_RUN_TIMEOUT = timedelta(minutes=15)
 DEFAULT_MAX_ATTEMPTS = 3
 
 
+@dataclass
+class _TypeConfig:
+    run_timeout: timedelta = DEFAULT_RUN_TIMEOUT
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
 class InMemoryStore:
     """Process-local ``Store`` used by the unit tests and for service-less dev.
 
@@ -71,19 +92,27 @@ class InMemoryStore:
         self._jobs: dict[int, Job] = {}
         self._outbox: dict[int, OutboxMessage] = {}
         self._published: set[int] = set()
-        self._type_config: dict[str, tuple[timedelta, int]] = {}
+        self._type_config: dict[str, _TypeConfig] = {}
         self._job_ids = itertools.count(1)
         self._outbox_ids = itertools.count(1)
 
     # -- test helpers ------------------------------------------------------
-    def set_type_config(self, job_type: str, run_timeout: timedelta, max_attempts: int) -> None:
-        self._type_config[job_type] = (run_timeout, max_attempts)
+    def set_type_config(
+        self,
+        job_type: str,
+        run_timeout: timedelta = DEFAULT_RUN_TIMEOUT,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._type_config[job_type] = _TypeConfig(run_timeout, max_attempts, payload or {})
 
     def _timeout(self, job_type: str) -> timedelta:
-        return self._type_config.get(job_type, (DEFAULT_RUN_TIMEOUT, DEFAULT_MAX_ATTEMPTS))[0]
+        cfg = self._type_config.get(job_type)
+        return cfg.run_timeout if cfg else DEFAULT_RUN_TIMEOUT
 
     def _max_attempts(self, job_type: str) -> int:
-        return self._type_config.get(job_type, (DEFAULT_RUN_TIMEOUT, DEFAULT_MAX_ATTEMPTS))[1]
+        cfg = self._type_config.get(job_type)
+        return cfg.max_attempts if cfg else DEFAULT_MAX_ATTEMPTS
 
     def _active(self, job_type: str) -> bool:
         return any(
@@ -92,16 +121,14 @@ class InMemoryStore:
         )
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str, payload: dict) -> int | None:
+    def enqueue(self, job_type: str) -> int | None:
         if self._active(job_type):
             return None
         job_id = next(self._job_ids)
-        self._jobs[job_id] = Job(
-            id=job_id, job_type=job_type, status=JobStatus.QUEUED, payload=payload
-        )
+        self._jobs[job_id] = Job(id=job_id, job_type=job_type, status=JobStatus.QUEUED)
         outbox_id = next(self._outbox_ids)
         self._outbox[outbox_id] = OutboxMessage(
-            id=outbox_id, job_id=job_id, payload=build_envelope(job_id, job_type, payload)
+            id=outbox_id, job_id=job_id, payload=build_envelope(job_id, job_type)
         )
         return job_id
 
@@ -128,6 +155,17 @@ class InMemoryStore:
             job.updated_at = utcnow()
             return True
         return False
+
+    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
+        job = self._jobs.get(job_id)
+        if not job or job.status != JobStatus.RUNNING:
+            return None
+        cfg = self._type_config.get(job.job_type)
+        if cfg is None:
+            return None  # no config row -> un-runnable
+        job.payload = deepcopy(cfg.payload)
+        job.updated_at = utcnow()
+        return job.payload
 
     def complete(self, job_id: int) -> bool:
         return self._terminal(job_id, JobStatus.COMPLETED)

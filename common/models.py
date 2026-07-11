@@ -63,6 +63,12 @@ class StuckJob:
     attempts: int
 
 
-def build_envelope(job_id: int, job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """The single message envelope every job type shares on the Kafka topic."""
-    return {"job_id": job_id, "job_type": job_type, "payload": payload}
+def build_envelope(job_id: int, job_type: str) -> dict[str, Any]:
+    """The single message envelope every job type shares on the Kafka topic.
+
+    Deliberately a pure pointer: ``job_id`` identifies the run and ``job_type``
+    routes it. The business payload is *not* carried here — it lives in
+    ``job_type_config`` and the worker snapshots it into ``jobs`` when it claims
+    the run, so producers (AutoSys/handler) never carry business data.
+    """
+    return {"job_id": job_id, "job_type": job_type}

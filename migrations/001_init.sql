@@ -23,7 +23,7 @@ CREATE INDEX IF NOT EXISTS jobs_type_created_idx ON jobs (job_type, created_at D
 CREATE TABLE IF NOT EXISTS outbox (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_id       BIGINT      NOT NULL REFERENCES jobs(id),
-    payload      JSONB       NOT NULL,                  -- {job_id, job_type, payload}
+    payload      JSONB       NOT NULL,                  -- envelope: {job_id, job_type}
     published_at TIMESTAMPTZ
 );
 
