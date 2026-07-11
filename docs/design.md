@@ -130,7 +130,7 @@ Crash before publish → row stays `published_at IS NULL` → retried next loop 
 - **Every run is its own row.** The partial unique index (§1) only blocks a *second active* row per `job_type` — it does **not** delete or reuse the old one. So each successful queue creates a new row, and completed/failed rows stay in the table forever. Over time `jobs` naturally accumulates one row per run per `job_type` — that *is* the run history.
 - **Timings come from the row itself.** `created_at` (queued), `updated_at` (last transition), and `status` tell you what happened to each run and roughly when. "Show me every `settlement` run this month and how each ended" is a single `SELECT ... WHERE job_type='settlement' ORDER BY created_at`.
 - **`jobs.id` is the run/correlation id.** It's auto-generated and unique per row = unique per run, so the worker just stamps `jobs.id` on every log line it ships to the SIEM. From any DB row you pivot straight to that run's full step-by-step timeline in the SIEM. No second table needed to link them.
-- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status='dispatched'`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required.
+- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status IN ('queued','dispatched')`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required. (Accepting `queued` as well as `dispatched` matters: the dispatcher publishes to Kafka *before* it marks the row `dispatched`, so a fast worker can receive the message while the row is still `queued` — requiring only `dispatched` would strand it.)
 
 So the division of labor is dead simple: **`jobs`** = current state *and* durable per-run history (+ the run_id for SIEM), and **the SIEM** = the detailed step-by-step narrative. The `outbox` is the only other table.
 
@@ -334,9 +334,11 @@ COMMIT;
 
 ```sql
 -- claim (compare-and-set): exactly one worker wins a redelivered message
+-- accept queued OR dispatched: the dispatcher publishes to Kafka before it marks
+-- the row 'dispatched', so a fast worker can outrace that and see it still 'queued'
 UPDATE jobs SET status = 'running', updated_at = now()
-WHERE id = :job_id AND status = 'dispatched';
--- 0 rows affected => someone else owns it (or it's not dispatchable) => ack & skip
+WHERE id = :job_id AND status IN ('queued', 'dispatched');
+-- 0 rows affected => someone else owns it (or it's terminal) => ack & skip
 
 -- on success (then commit Kafka offset AFTER this commits):
 UPDATE jobs SET status = 'completed', updated_at = now()
