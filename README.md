@@ -12,7 +12,7 @@ the source of truth, Kafka is transport. See
 | `common/` | shared contract | job model, statuses, message envelope, config, `Store` (Postgres + in-memory) |
 | `handler/` | producer | dedup-insert a job + outbox row in one transaction (AutoSys stand-in CLI) |
 | `dispatcher/` | dispatcher | drain the outbox to Kafka (`FOR UPDATE SKIP LOCKED`) |
-| `worker/` | worker | consume Kafka, claim (compare-and-set), snapshot config payload, run the job-type handler |
+| `worker/` | worker | consume Kafka, claim (compare-and-set), resolve the effective payload (base config + input overrides), run the job-type handler |
 | `reaper/` | reaper | recover jobs stuck in `running` (per-type timeout + churn cap) |
 | `migrations/` | schema | idempotent DDL |
 
@@ -21,22 +21,30 @@ the source of truth, Kafka is transport. See
 `job_type_config` row (its `payload`, `run_timeout`, `max_attempts`). The
 handler, dispatcher, and reaper are all type-agnostic (`job_type` is just data).
 
-**The message envelope is a pure pointer** — `{job_id, job_type}`. Producers
-(AutoSys/handler) only *name* the job; the business payload lives in
-`job_type_config` and the worker snapshots it into `jobs.payload` when it claims
-the run (so each run records the exact inputs it used). A type with no config
+**The message envelope is a pure pointer** — `{job_id, job_type}`. Each
+`job_type` has a **base config** in `job_type_config.payload` (the master set of
+keys with defaults). Producers (AutoSys/handler) name the job and *may* pass an
+optional per-run payload of overrides, stored in `jobs.input_payload`. When the
+worker claims the run it resolves the **effective payload** = base config
+overlaid with the input (input wins per key), snapshots it into `jobs.payload`
+(so each run records the exact config it used), and runs it. The override rides
+in the DB row, never on the wire. A type with no config
 row is un-runnable: the worker fails such a run gracefully.
 
 ## Run it (docker compose)
 
 ```bash
 docker compose up --build -d          # postgres, kafka, migrate, dispatcher, worker, reaper
-docker compose run --rm handler hello   # enqueue a job (payload comes from job_type_config)
+docker compose run --rm handler hello                       # enqueue with base config only
+docker compose run --rm handler hello '{"name":"Grace"}'    # override a base key per run
 docker compose logs -f worker         # watch it get processed
 ```
 
-The `migrate` step seeds `job_type_config` rows for the demo types `hello`
-(`{"name": "Ada"}`) and `boom` (`{}`). To add/override a type's payload:
+The `migrate` step seeds `job_type_config` base-config rows for the demo types
+`hello` (`{"name": "Ada"}`) and `boom` (`{}`). A producer payload overrides these
+per run, e.g. `handler hello '{"name":"Grace"}'` runs with `{"name":"Grace"}`
+while `handler hello` runs with the base `{"name":"Ada"}`. To change a type's
+base config:
 
 ```bash
 docker compose exec postgres psql -U app -d app -c \

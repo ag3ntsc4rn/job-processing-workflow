@@ -45,6 +45,43 @@ def test_worker_snapshots_config_payload_into_the_run():
     assert store.get_job(job_id).payload == {"name": "Ada"}
 
 
+def test_worker_merges_base_config_with_input_payload_input_wins():
+    store = InMemoryStore()
+    store.set_type_config(
+        "hello", payload={"region": "us-east-1", "batch_size": 100, "dry_run": False}
+    )
+    # producer overrides one key and adds a new one; base keys untouched remain
+    job_id = enqueue(store, "hello", {"batch_size": 25, "customer_id": "C123"}).job_id
+    env = _dispatch(store, job_id)
+
+    seen = {}
+    process(store, lambda _t: lambda p: seen.update(p), env)
+
+    expected = {
+        "region": "us-east-1",  # base kept
+        "batch_size": 25,  # input overrode base
+        "dry_run": False,  # base kept
+        "customer_id": "C123",  # input added
+    }
+    assert seen == expected
+    job = store.get_job(job_id)
+    assert job.payload == expected  # effective snapshot
+    assert job.input_payload == {"batch_size": 25, "customer_id": "C123"}  # audit
+
+
+def test_worker_uses_base_config_when_no_input_payload():
+    store = InMemoryStore()
+    store.set_type_config("hello", payload={"name": "Ada"})
+    job_id = enqueue(store, "hello").job_id  # no producer payload
+    env = _dispatch(store, job_id)
+
+    seen = {}
+    process(store, lambda _t: lambda p: seen.update(p), env)
+
+    assert seen == {"name": "Ada"}
+    assert store.get_job(job_id).input_payload == {}
+
+
 def test_process_fails_gracefully_when_type_has_no_config():
     store = InMemoryStore()
     job_id = enqueue(store, "orphan").job_id  # no set_type_config -> no config row

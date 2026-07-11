@@ -47,17 +47,17 @@ class PostgresStore:
         self._pool.close()
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str) -> int | None:
+    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
         with self._pool.connection() as conn:
             with conn.transaction():
                 row = conn.execute(
                     """
-                    INSERT INTO jobs (job_type)
-                    VALUES (%s)
+                    INSERT INTO jobs (job_type, input_payload)
+                    VALUES (%s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
-                    (job_type,),
+                    (job_type, Jsonb(input_payload or {})),
                 ).fetchone()
                 if row is None:
                     return None  # an active job of this type already exists
@@ -108,15 +108,16 @@ class PostgresStore:
             job_id,
         )
 
-    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
-        # Copy the type's configured payload into the claimed run, recording the
-        # exact inputs it ran with. Joins job_type_config, so a type with no
-        # config row yields no updated row -> None -> the worker fails it.
+    def resolve_payload(self, job_id: int, job_type: str) -> dict | None:
+        # Overlay the run's input_payload on the type's base config (jsonb ||:
+        # shallow merge, right side wins), snapshot the effective result into
+        # jobs.payload, and return it. Joins job_type_config, so a type with no
+        # base config row yields no updated row -> None -> the worker fails it.
         with self._pool.connection() as conn:
             row = conn.execute(
                 """
                 UPDATE jobs j
-                SET payload = c.payload, updated_at = now()
+                SET payload = c.payload || j.input_payload, updated_at = now()
                 FROM job_type_config c
                 WHERE j.id = %s AND c.job_type = %s AND j.status = 'running'
                 RETURNING j.payload
@@ -194,7 +195,8 @@ class PostgresStore:
         with self._pool.connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, job_type, status, payload, attempts, created_at, updated_at
+                SELECT id, job_type, status, input_payload, payload, attempts,
+                       created_at, updated_at
                 FROM jobs WHERE id = %s
                 """,
                 (job_id,),
@@ -205,8 +207,9 @@ class PostgresStore:
             id=int(row[0]),
             job_type=row[1],
             status=row[2],
-            payload=row[3],
-            attempts=int(row[4]),
-            created_at=row[5],
-            updated_at=row[6],
+            input_payload=row[3],
+            payload=row[4],
+            attempts=int(row[5]),
+            created_at=row[6],
+            updated_at=row[7],
         )

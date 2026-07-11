@@ -19,7 +19,8 @@ def process(store: Store, lookup: Lookup, envelope: dict) -> str:
     (unknown type or handler raised).
 
     The message envelope is a pure pointer (``job_id``/``job_type``); the
-    business payload is snapshotted from ``job_type_config`` at claim time.
+    effective payload is resolved at claim time by overlaying the run's
+    ``input_payload`` on the type's base ``job_type_config`` (input wins).
     """
     job_id = envelope["job_id"]
     job_type = envelope["job_type"]
@@ -27,10 +28,10 @@ def process(store: Store, lookup: Lookup, envelope: dict) -> str:
     if not store.claim(job_id):
         return "skipped"  # another worker already owns this run
 
-    payload = store.snapshot_config_payload(job_id, job_type)
+    payload = store.resolve_payload(job_id, job_type)
     if payload is None:
         store.fail(job_id)
-        return "no_config"  # no config for this type -> nothing to run
+        return "no_config"  # no base config for this type -> nothing to run
 
     handler = lookup(job_type)
     if handler is None:

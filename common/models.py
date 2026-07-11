@@ -39,6 +39,9 @@ class Job:
     id: int
     job_type: str
     status: str
+    # what the producer sent at enqueue (optional overrides); audit of the request
+    input_payload: dict[str, Any] = field(default_factory=dict)
+    # effective config the run used: base config overlaid with input, snapshotted at claim
     payload: dict[str, Any] = field(default_factory=dict)
     attempts: int = 0
     created_at: datetime = field(default_factory=utcnow)

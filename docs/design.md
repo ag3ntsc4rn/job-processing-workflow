@@ -22,7 +22,8 @@ CREATE TABLE jobs (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_type    TEXT        NOT NULL,
     status      TEXT        NOT NULL DEFAULT 'queued',  -- queued|dispatched|running|completed|failed
-    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- snapshot of job_type_config.payload, taken by the worker at claim
+    input_payload JSONB     NOT NULL DEFAULT '{}'::jsonb, -- optional per-run overrides the producer sent (audit of the request)
+    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- effective config the run used = base config || input, snapshotted at claim
     attempts    INT         NOT NULL DEFAULT 0,          -- times this run has been (re)dispatched; for churn cap (§7)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -35,12 +36,12 @@ CREATE UNIQUE INDEX jobs_one_active_per_type
     WHERE status IN ('queued', 'dispatched', 'running');
 ```
 
-Per-`job_type` config lives in a tiny lookup table (one row per type) — the business **payload** for the type plus its stuck-run timeout and churn cap — so none of it is hard-coded and producers never carry it:
+Per-`job_type` config lives in a tiny lookup table (one row per type) — the **base payload** for the type plus its stuck-run timeout and churn cap — so none of it is hard-coded and it works whether or not a producer sends anything:
 
 ```sql
 CREATE TABLE job_type_config (
     job_type      TEXT PRIMARY KEY,
-    payload       JSONB    NOT NULL DEFAULT '{}'::jsonb, -- the business inputs for this type (worker snapshots it at claim)
+    payload       JSONB    NOT NULL DEFAULT '{}'::jsonb, -- base config: the master set of keys with defaults for this type
     run_timeout   INTERVAL NOT NULL DEFAULT '15 min',   -- how long a run may sit in 'running' before it's stuck
     max_attempts  INT      NOT NULL DEFAULT 3           -- reclaim cap before dead-letter (§7)
 );
@@ -48,7 +49,7 @@ CREATE TABLE job_type_config (
 
 > `attempts` here is **not** business retries (that's still Option A). It only counts how many times the *reaper* has re-dispatched a stuck run, so a poison job can't loop forever.
 
-> **Payload-as-config:** the business inputs live in `job_type_config.payload`, not in the message. Producers (AutoSys/handler) only *name* the `job_type`; the worker snapshots this payload into `jobs.payload` when it claims the run, so each run durably records the inputs it used even if the config later changes. A type with **no** config row is un-runnable — the worker fails such a run gracefully rather than leaving the dedup slot occupied.
+> **Base config + optional per-run overrides.** Every `job_type` has a **base config** in `job_type_config.payload` — the master set of keys with defaults. A producer (AutoSys or anything else) *may* pass an optional per-run JSON payload, which is stored in `jobs.input_payload` (durable audit of exactly what was requested). When the worker claims the run it computes the **effective payload** = `base_config` overlaid with `input_payload`, where **input keys win** per key, and snapshots that into `jobs.payload`. So a run with no producer payload runs on pure defaults; a run that sends `{"batch_size": 25}` overrides just that key and inherits the rest. The merge is a **shallow** object merge (top-level keys; nested objects are replaced wholesale, matching Postgres `||`). The override rides in the DB row, **never on the Kafka message** — the envelope stays a pure pointer. A type with **no** config row is un-runnable — the worker fails such a run gracefully rather than leaving the dedup slot occupied.
 
 Plus a tiny **outbox** table so the handler never has to write to the DB and Kafka in the same breath (§3):
 
@@ -100,9 +101,9 @@ queued ──► running ──► completed
 **Handler** — one transaction, two inserts (the outbox row is what the dispatcher will send):
 ```sql
 BEGIN;
-  INSERT INTO jobs (job_type) VALUES (?)
+  INSERT INTO jobs (job_type, input_payload) VALUES (?, ?)
     ON CONFLICT DO NOTHING            -- 0 rows = already active, skip
-    RETURNING id;
+    RETURNING id;                     -- input_payload defaults to '{}' when the producer sends nothing
   -- only if a row was inserted (outbox payload is the pointer envelope, no business data):
   INSERT INTO outbox (job_id, payload) VALUES (?, ?);
 COMMIT;
@@ -122,7 +123,7 @@ LIMIT 100;
 ```
 Crash before publish → row stays `published_at IS NULL` → retried next loop (at-least-once). Crash after publish but before the UPDATE → message re-sent → duplicate, absorbed by the worker guard in §6.
 
-**Worker** — consumes from Kafka, claims the run, **snapshots `job_type_config.payload` into `jobs.payload`** (recording the inputs this run used; a type with no config row is failed gracefully), does the work, and sets `completed` or `failed`.
+**Worker** — consumes from Kafka, claims the run, **resolves the effective payload** (`job_type_config.payload` overlaid with the run's `input_payload`, input keys winning) and snapshots it into `jobs.payload` (recording the exact config this run used; a type with no config row is failed gracefully), does the work, and sets `completed` or `failed`. In Postgres the merge is one statement: `SET payload = c.payload || j.input_payload`.
 
 ---
 
@@ -133,7 +134,7 @@ Crash before publish → row stays `published_at IS NULL` → retried next loop 
 - **Every run is its own row.** The partial unique index (§1) only blocks a *second active* row per `job_type` — it does **not** delete or reuse the old one. So each successful queue creates a new row, and completed/failed rows stay in the table forever. Over time `jobs` naturally accumulates one row per run per `job_type` — that *is* the run history.
 - **Timings come from the row itself.** `created_at` (queued), `updated_at` (last transition), and `status` tell you what happened to each run and roughly when. "Show me every `settlement` run this month and how each ended" is a single `SELECT ... WHERE job_type='settlement' ORDER BY created_at`.
 - **`jobs.id` is the run/correlation id.** It's auto-generated and unique per row = unique per run, so the worker just stamps `jobs.id` on every log line it ships to the SIEM. From any DB row you pivot straight to that run's full step-by-step timeline in the SIEM. No second table needed to link them.
-- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status IN ('queued','dispatched')`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required. Right after winning the claim, the worker snapshots `job_type_config.payload` into this row so the run records its inputs. (Accepting `queued` as well as `dispatched` matters: the dispatcher publishes to Kafka *before* it marks the row `dispatched`, so a fast worker can receive the message while the row is still `queued` — requiring only `dispatched` would strand it.)
+- **Claim guard lives on `jobs` too.** The worker claims a redelivered-safe run with a compare-and-set: `UPDATE jobs SET status='running' WHERE id=? AND status IN ('queued','dispatched')`. Only one worker's UPDATE matches; a duplicate delivery gets `0 rows` and simply acks and skips (§6). No `UNIQUE(job_id)` on a separate table required. Right after winning the claim, the worker resolves `job_type_config.payload || jobs.input_payload` and snapshots it into `jobs.payload` so the run records the exact config it used. (Accepting `queued` as well as `dispatched` matters: the dispatcher publishes to Kafka *before* it marks the row `dispatched`, so a fast worker can receive the message while the row is still `queued` — requiring only `dispatched` would strand it.)
 
 So the division of labor is dead simple: **`jobs`** = current state *and* durable per-run history (+ the run_id for SIEM), and **the SIEM** = the detailed step-by-step narrative. The `outbox` is the only other table.
 
@@ -241,14 +242,24 @@ Four deployable components + a shared contract library. The organizing principle
 
 Because `job_type` is data, three of the four components never change:
 
-- **handler** — `INSERT INTO jobs(job_type)`; `job_type` is passed straight through, no `switch`, and it carries **no business payload** at all.
+- **handler** — `INSERT INTO jobs(job_type, input_payload)`; `job_type` is passed straight through, no `switch`. It never *interprets* the payload — it just stores the producer's optional overrides for the worker to merge later.
 - **dispatcher** — copies `outbox` bytes to Kafka; never inspects the payload.
 - **reaper** — acts on `status`/timeout; per-type timeouts come from the `job_type_config` **table**, not code.
 - **worker** — the *only* place type logic lives. A registry (like a `@register("my_type")` decorator) maps `job_type` → a handler class. New type = add one handler, register it, deploy the worker.
 
-The one non-code step is a `job_type_config` **row** (`payload`, `run_timeout`, `max_attempts`) — a data insert, not a redeploy. `run_timeout`/`max_attempts` fall back to defaults when absent, but the **payload** must be present: a type with no config row has no inputs to run, so the worker fails such a run gracefully.
+The one non-code step is a `job_type_config` **row** (`payload`, `run_timeout`, `max_attempts`) — a data insert, not a redeploy. `run_timeout`/`max_attempts` fall back to defaults when absent, but the **base payload** must be present: it's the master set of keys with defaults, so a type with no config row has nothing to run and the worker fails such a run gracefully.
 
-**Contract to hold the line:** every type shares one **message envelope** (`{job_id, job_type}` — a pure pointer; the payload lives in `job_type_config`) on one **topic**. As long as that's stable, the generic components never redeploy. A type needing a different envelope or its own topic/ordering is the only thing that would touch the dispatcher/contract — so agree on a stable envelope up front.
+**Contract to hold the line:** every type shares one **message envelope** (`{job_id, job_type}` — a pure pointer; base config lives in `job_type_config`, per-run overrides in `jobs.input_payload`) on one **topic**. As long as that's stable, the generic components never redeploy. A type needing a different envelope or its own topic/ordering is the only thing that would touch the dispatcher/contract — so agree on a stable envelope up front.
+
+### How other processes enqueue (without duplicating the insert)
+
+AutoSys is just one producer; the queue is source-agnostic (see the intro). The one thing every producer must do identically is *the enqueue transaction* — insert `jobs` + `outbox` atomically and let the partial unique index handle dedup. That logic must live in **exactly one place** so it can't drift. In this repo that place is `handler.service.enqueue(store, job_type, payload=None)`. Producers reuse it three ways, none of which re-implement the SQL:
+
+- **Import it** — an in-process/Python producer depends on the shared package and calls `enqueue(...)` directly (this is the "shared contract lib" from the multi-repo topology).
+- **Call it over HTTP** — wrap `enqueue` in a thin endpoint (`POST /jobs {job_type, payload}`) for producers that aren't Python or shouldn't hold DB credentials. The handler service owns the DB; callers just POST.
+- **Shell out** — `python -m handler <job_type> [payload_json]`, which is what an AutoSys job definition invokes.
+
+The anti-pattern to avoid is a producer hand-writing its own `INSERT INTO jobs ...` — that duplicates the jobs+outbox+dedup invariant and is where correctness drifts over time. Direct SQL is acceptable only as a deliberate, versioned dependency on the schema, not as the default.
 
 ---
 
@@ -264,7 +275,8 @@ CREATE TABLE jobs (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     job_type    TEXT        NOT NULL,
     status      TEXT        NOT NULL DEFAULT 'queued',  -- queued|dispatched|running|completed|failed
-    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- snapshot of job_type_config.payload, taken by the worker at claim
+    input_payload JSONB     NOT NULL DEFAULT '{}'::jsonb, -- optional per-run overrides the producer sent (audit of the request)
+    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- effective config the run used = base config || input, snapshotted at claim
     attempts    INT         NOT NULL DEFAULT 0,          -- reaper re-dispatch count (churn cap), NOT business retries
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -289,9 +301,10 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
 
--- Per-type config: the business payload (worker snapshots it at claim) plus
--- stuck-run tuning. run_timeout/max_attempts fall back to defaults when absent;
--- a type with no row is un-runnable (the worker fails the run gracefully).
+-- Per-type config: the base payload (master set of keys with defaults; the
+-- worker overlays each run's input on it at claim) plus stuck-run tuning.
+-- run_timeout/max_attempts fall back to defaults when absent; a type with no
+-- row is un-runnable (the worker fails the run gracefully).
 CREATE TABLE job_type_config (
     job_type      TEXT PRIMARY KEY,
     payload       JSONB    NOT NULL DEFAULT '{}'::jsonb,
@@ -305,9 +318,10 @@ CREATE TABLE job_type_config (
 ```sql
 BEGIN;
   -- dedup is enforced by the partial unique index; 0 rows back = already active, skip.
-  -- No business payload here: producers only name the job_type.
-  INSERT INTO jobs (job_type)
-  VALUES (:job_type)
+  -- input_payload is the producer's optional overrides ('{}' when none); the
+  -- worker merges it onto the base config at claim. No business data on the wire.
+  INSERT INTO jobs (job_type, input_payload)
+  VALUES (:job_type, :input_payload)
   ON CONFLICT DO NOTHING
   RETURNING id;
 
@@ -348,10 +362,11 @@ UPDATE jobs SET status = 'running', updated_at = now()
 WHERE id = :job_id AND status IN ('queued', 'dispatched');
 -- 0 rows affected => someone else owns it (or it's terminal) => ack & skip
 
--- snapshot the type's configured payload into this run (records the inputs used).
--- 0 rows => no job_type_config row for this type => fail the run gracefully.
+-- resolve the effective payload: base config overlaid with this run's input
+-- (|| is a shallow merge, right side wins), snapshotted so the run records what
+-- it used. 0 rows => no job_type_config row for this type => fail gracefully.
 UPDATE jobs j
-SET payload = c.payload, updated_at = now()
+SET payload = c.payload || j.input_payload, updated_at = now()
 FROM job_type_config c
 WHERE j.id = :job_id AND c.job_type = j.job_type AND j.status = 'running'
 RETURNING j.payload;

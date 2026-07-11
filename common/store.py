@@ -20,13 +20,13 @@ from common.models import Job, JobStatus, OutboxMessage, StuckJob, build_envelop
 
 class Store(Protocol):
     # --- handler ---
-    def enqueue(self, job_type: str) -> int | None:
+    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
         """Insert a job + its outbox row in one transaction.
 
-        Only the ``job_type`` is named; the business payload lives in
-        ``job_type_config`` and is snapshotted by the worker at claim time.
-        Returns the new job id, or ``None`` if an active job of this type
-        already exists (dedup) so the caller should skip.
+        ``job_type`` is named; ``input_payload`` is the producer's optional key
+        overrides (stored for audit and overlaid on the type's base config by the
+        worker at claim time). Returns the new job id, or ``None`` if an active
+        job of this type already exists (dedup) so the caller should skip.
         """
         ...
 
@@ -39,13 +39,15 @@ class Store(Protocol):
         """Compare-and-set ``queued|dispatched -> running``. True iff caller won."""
         ...
 
-    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
-        """Copy this type's ``job_type_config.payload`` into the claimed run.
+    def resolve_payload(self, job_id: int, job_type: str) -> dict | None:
+        """Compute + snapshot the claimed run's effective payload.
 
-        Returns the snapshotted payload, or ``None`` if the type has no config
-        row (the run is then un-runnable and the worker fails it gracefully).
-        Records the exact inputs the run used, so ``jobs`` keeps durable
-        per-run history even though config can change between runs.
+        Overlays the run's ``input_payload`` on the type's base config
+        (``job_type_config.payload``), input winning per key, writes the result
+        into ``jobs.payload``, and returns it. Returns ``None`` if the type has
+        no config row (the run is then un-runnable and the worker fails it
+        gracefully). Snapshotting records the exact config the run used, so
+        ``jobs`` keeps durable per-run history even if config changes later.
         """
         ...
 
@@ -121,11 +123,16 @@ class InMemoryStore:
         )
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str) -> int | None:
+    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
         if self._active(job_type):
             return None
         job_id = next(self._job_ids)
-        self._jobs[job_id] = Job(id=job_id, job_type=job_type, status=JobStatus.QUEUED)
+        self._jobs[job_id] = Job(
+            id=job_id,
+            job_type=job_type,
+            status=JobStatus.QUEUED,
+            input_payload=deepcopy(input_payload or {}),
+        )
         outbox_id = next(self._outbox_ids)
         self._outbox[outbox_id] = OutboxMessage(
             id=outbox_id, job_id=job_id, payload=build_envelope(job_id, job_type)
@@ -156,14 +163,15 @@ class InMemoryStore:
             return True
         return False
 
-    def snapshot_config_payload(self, job_id: int, job_type: str) -> dict | None:
+    def resolve_payload(self, job_id: int, job_type: str) -> dict | None:
         job = self._jobs.get(job_id)
         if not job or job.status != JobStatus.RUNNING:
             return None
         cfg = self._type_config.get(job.job_type)
         if cfg is None:
-            return None  # no config row -> un-runnable
-        job.payload = deepcopy(cfg.payload)
+            return None  # no base config row -> un-runnable
+        # base config supplies defaults; the producer's input overrides per key
+        job.payload = {**deepcopy(cfg.payload), **deepcopy(job.input_payload)}
         job.updated_at = utcnow()
         return job.payload
 

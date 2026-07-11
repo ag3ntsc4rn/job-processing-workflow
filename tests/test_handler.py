@@ -37,7 +37,13 @@ def test_enqueue_allows_new_run_after_terminal():
     assert second.job_id != first.job_id
 
 
-def test_enqueue_defaults_payload_to_empty_dict():
+def test_enqueue_defaults_input_payload_to_empty_dict():
     store = InMemoryStore()
     result = enqueue(store, "hello")
-    assert store.get_job(result.job_id).payload == {}
+    assert store.get_job(result.job_id).input_payload == {}
+
+
+def test_enqueue_stores_producer_input_payload():
+    store = InMemoryStore()
+    result = enqueue(store, "hello", {"batch_size": 25})
+    assert store.get_job(result.job_id).input_payload == {"batch_size": 25}
