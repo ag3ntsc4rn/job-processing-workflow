@@ -5,11 +5,16 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's dependency-injection idiom relies on `Depends(...)` in defaults.
+"handlerAPI/routes.py" = ["B008"]
+"handlerAPI/deps.py" = ["B008"]
+
 [tool.pytest.ini_options]
 addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
 
 [tool.coverage.run]
-source = ["common", "handler", "dispatcher", "worker", "reaper"]
+source = ["common", "handler", "handlerAPI", "dispatcher", "worker", "reaper"]
 omit = [
     "*/__main__.py",
     "common/db.py",

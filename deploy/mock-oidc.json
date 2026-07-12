@@ -1,0 +1,30 @@
+{
+  "tokenCallbacks": [
+    {
+      "issuerId": "default",
+      "requestMappings": [
+        {
+          "requestParam": "grant_type",
+          "match": "client_credentials",
+          "claims": {
+            "sub": "autosys-svc",
+            "aud": ["job-api"],
+            "scope": "jobs.write jobs.read",
+            "client_id": "autosys-svc"
+          }
+        },
+        {
+          "requestParam": "grant_type",
+          "match": "authorization_code",
+          "claims": {
+            "aud": ["job-api"],
+            "scope": "jobs.write jobs.read",
+            "email": "dev.user@example.test",
+            "client_id": "webapp-spa",
+            "groups": ["job-users"]
+          }
+        }
+      ]
+    }
+  ]
+}

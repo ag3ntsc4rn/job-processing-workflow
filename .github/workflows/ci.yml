@@ -20,7 +20,49 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
       - name: Test (pytest)
-        run: pytest -q
+        run: pytest -q --junitxml=pytest-junit.xml
+      - name: Test results summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+
+          try:
+              root = ET.parse("pytest-junit.xml").getroot()
+          except (FileNotFoundError, ET.ParseError):
+              print("## Test results\n\n_No test report produced._")
+              raise SystemExit(0)
+
+          suites = root.findall("testsuite") or [root]
+          tests = failures = errors = skipped = 0
+          time = 0.0
+          failed = []
+          for s in suites:
+              tests += int(s.get("tests", 0))
+              failures += int(s.get("failures", 0))
+              errors += int(s.get("errors", 0))
+              skipped += int(s.get("skipped", 0))
+              time += float(s.get("time", 0) or 0)
+              for case in s.findall("testcase"):
+                  bad = case.find("failure") is not None or case.find("error") is not None
+                  if bad:
+                      name = f'{case.get("classname", "")}::{case.get("name", "")}'.strip(":")
+                      failed.append(name)
+          passed = tests - failures - errors - skipped
+          icon = ":white_check_mark:" if not (failures or errors) else ":x:"
+          print("## Test results\n")
+          print("| Total | Passed | Failed | Errors | Skipped | Duration |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          print(
+              f"| {tests} | {passed} | {failures} | {errors} | {skipped} "
+              f"| {time:.2f}s {icon} |"
+          )
+          if failed:
+              print("\n<details><summary>Failed tests</summary>\n")
+              for name in failed:
+                  print(f"- `{name}`")
+              print("\n</details>")
+          PY
       - name: Coverage summary
         if: always()
         run: |
@@ -61,7 +103,7 @@ jobs:
       - name: Audit deps (pip-audit)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pip-audit==2.7.3
+          pip install -r requirements-api.txt pip-audit==2.7.3
           echo "## Dependency audit (pip-audit)" >> "$GITHUB_STEP_SUMMARY"
           set +e
           pip-audit -f markdown | tee -a "$GITHUB_STEP_SUMMARY"
@@ -81,9 +123,11 @@ jobs:
       - name: Apply migrations
         run: docker compose run --rm migrate
       - name: Build service images
-        run: docker compose build worker dispatcher handler
+        run: docker compose build worker dispatcher handler handlerapi
       - name: Start dispatcher + worker
         run: docker compose up -d dispatcher worker
+      - name: Start API + mock OIDC
+        run: docker compose up -d --wait handlerapi
       - name: Enqueue with a per-run override
         id: enqueue
         run: |
@@ -130,6 +174,29 @@ jobs:
           done
           [ "$st" = "failed" ]
           echo "value=ghost -> failed" >> "$GITHUB_OUTPUT"
+      - name: API - token -> POST -> GET, with authz
+        id: api
+        run: |
+          docker compose exec -T handlerapi python - <<'PY'
+          import httpx
+          base = "http://localhost:8080"
+          # unauthenticated write is rejected
+          assert httpx.post(f"{base}/v1/jobs", json={"job_type": "settlement"}).status_code == 401
+          tok = httpx.post("http://mock-oidc:8080/default/token",
+                           data={"grant_type": "client_credentials",
+                                 "client_id": "autosys-svc", "client_secret": "s"}
+                           ).json()["access_token"]
+          h = {"Authorization": f"Bearer {tok}"}
+          r = httpx.post(f"{base}/v1/jobs", json={"job_type": "settlement", "payload": {"region": "eu"}}, headers=h)
+          assert r.status_code == 201, r.text
+          jid = r.json()["job_id"]
+          g = httpx.get(f"{base}/v1/jobs/{jid}", headers=h).json()
+          assert g["input_payload"] == {"region": "eu"}, g
+          assert g["created_by"]["type"] == "service", g
+          assert httpx.post(f"{base}/v1/jobs", json={"job_type": "settlement"}, headers=h).status_code == 409
+          print("api ok: 401 -> 201 -> 200 -> 409")
+          PY
+          echo "value=401 -> 201 -> 200 -> 409" >> "$GITHUB_OUTPUT"
       - name: E2E summary
         if: always()
         run: |
@@ -141,6 +208,7 @@ jobs:
             echo "| Base⊕input effective payload | ${{ steps.merge.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.merge.outputs.value }}\` |"
             echo "| Pointer-only Kafka envelope | ${{ steps.envelope.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.envelope.outputs.value }}\` |"
             echo "| Missing config -> failed | ${{ steps.noconfig.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.noconfig.outputs.value }}\` |"
+            echo "| API authz (401->201->200->409) | ${{ steps.api.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.api.outputs.value }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Dump logs on failure
         if: failure()

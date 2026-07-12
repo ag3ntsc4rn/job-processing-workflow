@@ -21,7 +21,7 @@ import time
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from common.models import Job, OutboxMessage, StuckJob, build_envelope
+from common.models import Creator, Job, OutboxMessage, StuckJob, build_envelope
 
 _DEFAULT_RUN_TIMEOUT = "15 minutes"
 _DEFAULT_MAX_ATTEMPTS = 3
@@ -47,17 +47,31 @@ class PostgresStore:
         self._pool.close()
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
+    def enqueue(
+        self,
+        job_type: str,
+        input_payload: dict | None = None,
+        creator: Creator | None = None,
+    ) -> int | None:
+        creator = creator or Creator()
         with self._pool.connection() as conn:
             with conn.transaction():
                 row = conn.execute(
                     """
-                    INSERT INTO jobs (job_type, input_payload)
-                    VALUES (%s, %s)
+                    INSERT INTO jobs
+                        (job_type, input_payload,
+                         created_by_sub, created_by_type, created_by_client)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
-                    (job_type, Jsonb(input_payload or {})),
+                    (
+                        job_type,
+                        Jsonb(input_payload or {}),
+                        creator.sub,
+                        creator.type,
+                        creator.client_id,
+                    ),
                 ).fetchone()
                 if row is None:
                     return None  # an active job of this type already exists
@@ -196,7 +210,8 @@ class PostgresStore:
             row = conn.execute(
                 """
                 SELECT id, job_type, status, input_payload, payload, attempts,
-                       created_at, updated_at
+                       created_at, updated_at,
+                       created_by_sub, created_by_type, created_by_client
                 FROM jobs WHERE id = %s
                 """,
                 (job_id,),
@@ -212,4 +227,5 @@ class PostgresStore:
             attempts=int(row[5]),
             created_at=row[6],
             updated_at=row[7],
+            created_by=Creator(sub=row[8], type=row[9], client_id=row[10]),
         )
