@@ -279,8 +279,14 @@ CREATE TABLE jobs (
     payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- effective config the run used = base config || input, snapshotted at claim
     attempts    INT         NOT NULL DEFAULT 0,          -- reaper re-dispatch count (churn cap), NOT business retries
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- who enqueued it, from the HTTP API's validated OIDC token; NULL for the
+    -- CLI / direct producers (migration 004). job_id stays the SIEM correlation id.
+    created_by_sub    TEXT,   -- token `sub` (stable user/service id)
+    created_by_type   TEXT,   -- 'user' | 'service'
+    created_by_client TEXT    -- calling app's client_id / azp
 );
+CREATE INDEX jobs_created_by_sub_idx ON jobs (created_by_sub);
 
 -- At most one ACTIVE job per job_type. "Active" = every non-terminal status.
 CREATE UNIQUE INDEX jobs_one_active_per_type
@@ -423,6 +429,94 @@ SELECT j.id, j.job_type, j.updated_at
 FROM jobs j JOIN job_type_config c USING (job_type)
 WHERE j.status = 'running' AND j.updated_at < now() - c.run_timeout;
 ```
+
+---
+
+## 10. HTTP API (`handlerAPI/`)
+
+The `handler/` CLI stays as-is (it's still the K8s-Job/shell producer contract).
+`handlerAPI/` adds a **long-running FastAPI service** that exposes the same
+enqueue over HTTP so AutoSys, other machines, and humans can call it. It's the
+first slice of what will grow into a BFF (login/logout, server-side PKCE, cookie
+sessions) — hence versioned routes and a resource-server core that a cookie
+session can later plug into without changing the endpoints.
+
+**Key invariant preserved:** the API calls `store.enqueue(job_type, input, creator)`
+— the *same* jobs+outbox+dedup transaction the CLI uses. It never publishes to
+Kafka and never writes its own `INSERT`. The only new data is *who* enqueued
+(migration 004: `created_by_sub/type/client`), taken from the validated token.
+
+### 10.1 Endpoints
+
+```
+POST /v1/jobs         # scope jobs.write; body {job_type, payload?}; 201 + Location, or 409 (active dup)
+GET  /v1/jobs/{id}    # scope jobs.read; ownership-aware; 404 when absent/not-visible
+GET  /healthz         # liveness
+GET  /readyz          # readiness (checks the datastore)
+```
+
+### 10.2 Auth — OIDC resource server (Ping Federate)
+
+Every protected call carries `Authorization: Bearer <JWT>`. Validation is local
+(no per-request IdP round-trip):
+
+1. select the signing key by `kid` from the issuer's **JWKS** (cached, TTL +
+   refresh-on-unknown-`kid` to survive key rotation);
+2. verify signature (RS256 by default, configurable) + `iss` / `aud` / `exp` /
+   `nbf` with a clock-skew leeway;
+3. distil claims into a `Principal` (subject, `user`|`service` type, `client_id`,
+   scopes, groups).
+
+Both caller styles produce a token the API validates identically:
+
+- **M2M** (AutoSys): `client_credentials` (client id + secret). See
+  `scripts/enqueue_job.sh`.
+- **Human / web app**: authorization-code + **PKCE** (the SPA does the exchange
+  for now; moving it server-side is the BFF phase).
+
+`user` vs `service` is inferred from claims (a user-identity claim like `email`,
+or `sub != client_id`). **Scopes are provisional and configurable**
+(`jobs.write` / `jobs.read` / `jobs.read.all`); Ping is expected to also return
+**AD groups**, which are already captured on the `Principal` so authorization can
+key off them once the claim shape is confirmed — no endpoint changes needed.
+
+### 10.3 Read ownership
+
+`GET /v1/jobs/{id}` is ownership-aware: a human user reads only jobs they
+created; a `jobs.read.all` holder or a service principal reads any. Jobs the
+caller may not see return **404** (existence hidden), not 403. The rule lives in
+one function (`deps.can_read_job_created_by`) so a future group-based policy is a
+one-line change.
+
+### 10.4 Production hardening
+
+- **RFC 7807** `application/problem+json` for every error; internals (SQL, stack
+  traces) never leak — a request-id header ties a 500 back to the logs.
+- Strict input validation (unknown fields rejected; `job_type` pattern-checked).
+- Security headers (`X-Content-Type-Options`, `X-Frame-Options`, CSP, HSTS) +
+  per-request id; CORS allowlist.
+- **Rate limiting in-app** (slowapi), keyed per bearer credential, `RATE_LIMIT`
+  configurable; 429 as problem+json.
+- **TLS in-app** via `TLS_CERTFILE` / `TLS_KEYFILE` (plain HTTP when unset).
+- Runs as a non-root user in a dedicated image (`handlerAPI/Dockerfile`),
+  separate from the worker image so uvicorn/FastAPI aren't pulled into the other
+  components.
+
+> **Interim vs. target.** Rate limiting *and* TLS run in-app **now** by request,
+> but are expected to move to an **API gateway / load balancer** later; when they
+> do, run uvicorn behind the proxy with `--proxy-headers` and keep the in-app
+> limiter as defence in depth. The gateway would also host coarse quotas while
+> the app keeps per-principal fairness.
+
+### 10.5 Local stack
+
+`docker compose up handlerapi` also starts `mock-oidc`
+(`ghcr.io/navikt/mock-oauth2-server`, config in `deploy/mock-oidc.json`) as a
+stand-in for Ping — it issues tokens carrying the `aud` + `scope` (and, for the
+auth-code demo, `email` + `groups`) claims the API expects. This is **not** for
+production; point `OIDC_ISSUER` / `OIDC_JWKS_URL` at Ping there. CI's e2e job
+exercises the full `token → 401 (no token) → 201 → 200 → 409` path against this
+stack.
 
 ---
 

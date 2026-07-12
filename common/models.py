@@ -35,6 +35,20 @@ def utcnow() -> datetime:
 
 
 @dataclass
+class Creator:
+    """Identity of whoever enqueued a job, taken from the validated OIDC token.
+
+    ``type`` is ``'user'`` or ``'service'`` (client-credentials); ``client_id``
+    is the calling application. All optional so non-API producers (CLI, direct
+    callers) can enqueue without an identity.
+    """
+
+    sub: str | None = None
+    type: str | None = None
+    client_id: str | None = None
+
+
+@dataclass
 class Job:
     id: int
     job_type: str
@@ -46,6 +60,8 @@ class Job:
     attempts: int = 0
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+    # who enqueued it (populated by the HTTP API); None for CLI/direct producers
+    created_by: Creator | None = None
 
 
 @dataclass

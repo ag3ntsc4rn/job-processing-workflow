@@ -15,18 +15,33 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Protocol
 
-from common.models import Job, JobStatus, OutboxMessage, StuckJob, build_envelope, utcnow
+from common.models import (
+    Creator,
+    Job,
+    JobStatus,
+    OutboxMessage,
+    StuckJob,
+    build_envelope,
+    utcnow,
+)
 
 
 class Store(Protocol):
     # --- handler ---
-    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
+    def enqueue(
+        self,
+        job_type: str,
+        input_payload: dict | None = None,
+        creator: Creator | None = None,
+    ) -> int | None:
         """Insert a job + its outbox row in one transaction.
 
         ``job_type`` is named; ``input_payload`` is the producer's optional key
         overrides (stored for audit and overlaid on the type's base config by the
-        worker at claim time). Returns the new job id, or ``None`` if an active
-        job of this type already exists (dedup) so the caller should skip.
+        worker at claim time); ``creator`` is the enqueuing identity (populated by
+        the HTTP API, ``None`` for the CLI/direct callers). Returns the new job
+        id, or ``None`` if an active job of this type already exists (dedup) so
+        the caller should skip.
         """
         ...
 
@@ -123,7 +138,12 @@ class InMemoryStore:
         )
 
     # -- handler -----------------------------------------------------------
-    def enqueue(self, job_type: str, input_payload: dict | None = None) -> int | None:
+    def enqueue(
+        self,
+        job_type: str,
+        input_payload: dict | None = None,
+        creator: Creator | None = None,
+    ) -> int | None:
         if self._active(job_type):
             return None
         job_id = next(self._job_ids)
@@ -132,6 +152,7 @@ class InMemoryStore:
             job_type=job_type,
             status=JobStatus.QUEUED,
             input_payload=deepcopy(input_payload or {}),
+            created_by=creator,
         )
         outbox_id = next(self._outbox_ids)
         self._outbox[outbox_id] = OutboxMessage(

@@ -90,6 +90,38 @@ services:
       DATABASE_URL: postgresql://app:app@postgres:5432/app
       REAPER_POLL_INTERVAL: "30.0"
 
+  # Local stand-in for Ping Federate: an OIDC issuer with a JWKS endpoint.
+  # Its client-credentials / auth-code tokens carry the aud + scope claims the
+  # API expects (see deploy/mock-oidc.json). NOT for production.
+  mock-oidc:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.10
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./deploy/mock-oidc.json:/config/config.json:ro
+    environment:
+      JSON_CONFIG_PATH: /config/config.json
+
+  # The HTTP front door (long-running FastAPI service). Validates Ping-issued
+  # bearer tokens and reuses the shared enqueue transaction.
+  handlerapi:
+    build:
+      context: .
+      dockerfile: handlerAPI/Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mock-oidc:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/app
+      OIDC_ISSUER: http://mock-oidc:8080/default
+      OIDC_AUDIENCE: job-api
+      OIDC_JWKS_URL: http://mock-oidc:8080/default/jwks
+      RATE_LIMIT: 120/minute
+
   # Producer stand-in for AutoSys. Run on demand:
   #   docker compose run --rm handler hello '{"name":"Ada"}'
   handler:
