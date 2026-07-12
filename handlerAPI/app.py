@@ -12,15 +12,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 
 from common.store import Store
 from handlerAPI.auth import TokenVerifier, build_verifier
 from handlerAPI.config import Settings
 from handlerAPI.errors import register_error_handlers
 from handlerAPI.middleware import SecurityMiddleware
-from handlerAPI.ratelimit import build_limiter, rate_limit_handler
+from handlerAPI.ratelimit import RateLimitMiddleware
 from handlerAPI.routes import router
 
 
@@ -55,7 +53,6 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.limiter = build_limiter(settings)
     if store is not None:
         app.state.store = store
     if verifier is not None:
@@ -69,10 +66,9 @@ def create_app(
             allow_headers=["Authorization", "Content-Type"],
             allow_credentials=False,
         )
-    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(RateLimitMiddleware, settings=settings)
     app.add_middleware(SecurityMiddleware)
 
     register_error_handlers(app)
-    app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
     app.include_router(router)
     return app

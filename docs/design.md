@@ -495,8 +495,9 @@ one-line change.
 - Strict input validation (unknown fields rejected; `job_type` pattern-checked).
 - Security headers (`X-Content-Type-Options`, `X-Frame-Options`, CSP, HSTS) +
   per-request id; CORS allowlist.
-- **Rate limiting in-app** (slowapi), keyed per bearer credential, `RATE_LIMIT`
-  configurable; 429 as problem+json.
+- **Rate limiting in-app** (sliding window via the `limits` library, as pure
+  ASGI middleware — no coupling to framework router internals), keyed per bearer
+  credential, `RATE_LIMIT` configurable; 429 as problem+json.
 - **TLS in-app** via `TLS_CERTFILE` / `TLS_KEYFILE` (plain HTTP when unset).
 - Runs as a non-root user in a dedicated image (`handlerAPI/Dockerfile`),
   separate from the worker image so uvicorn/FastAPI aren't pulled into the other
