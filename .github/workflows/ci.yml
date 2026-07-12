@@ -20,7 +20,49 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
       - name: Test (pytest)
-        run: pytest -q
+        run: pytest -q --junitxml=pytest-junit.xml
+      - name: Test results summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+
+          try:
+              root = ET.parse("pytest-junit.xml").getroot()
+          except (FileNotFoundError, ET.ParseError):
+              print("## Test results\n\n_No test report produced._")
+              raise SystemExit(0)
+
+          suites = root.findall("testsuite") or [root]
+          tests = failures = errors = skipped = 0
+          time = 0.0
+          failed = []
+          for s in suites:
+              tests += int(s.get("tests", 0))
+              failures += int(s.get("failures", 0))
+              errors += int(s.get("errors", 0))
+              skipped += int(s.get("skipped", 0))
+              time += float(s.get("time", 0) or 0)
+              for case in s.findall("testcase"):
+                  bad = case.find("failure") is not None or case.find("error") is not None
+                  if bad:
+                      name = f'{case.get("classname", "")}::{case.get("name", "")}'.strip(":")
+                      failed.append(name)
+          passed = tests - failures - errors - skipped
+          icon = ":white_check_mark:" if not (failures or errors) else ":x:"
+          print("## Test results\n")
+          print("| Total | Passed | Failed | Errors | Skipped | Duration |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          print(
+              f"| {tests} | {passed} | {failures} | {errors} | {skipped} "
+              f"| {time:.2f}s {icon} |"
+          )
+          if failed:
+              print("\n<details><summary>Failed tests</summary>\n")
+              for name in failed:
+                  print(f"- `{name}`")
+              print("\n</details>")
+          PY
       - name: Coverage summary
         if: always()
         run: |
