@@ -89,11 +89,64 @@ tok=$(curl -fsS -X POST http://localhost:8081/default/token \
 # set OIDC_ISSUER to match, or mint from within the network. See docs/design.md.
 ```
 
-Configuration is entirely env-driven (`OIDC_ISSUER`, `OIDC_AUDIENCE`,
-`OIDC_JWKS_URL`, `SCOPE_*`, `OIDC_GROUPS_CLAIM`, `CORS_ALLOW_ORIGINS`,
-`RATE_LIMIT`, `TLS_CERTFILE`/`TLS_KEYFILE`, `HOST`/`PORT`); see
+Configuration is entirely env-driven; see the full
+[Configuration](#configuration-environment-variables) section below and
 [`handlerAPI/config.py`](handlerAPI/config.py). API deps live in
 `requirements-api.txt`.
+
+## Configuration (environment variables)
+
+Every service reads config from the environment. `common/config.py` is shared by
+`handler`, `dispatcher`, `worker`, `reaper`, and the `migrate` step (each uses
+only the subset it needs); `handlerAPI/config.py` holds the API-only settings.
+All have sensible local defaults so the docker-compose stack works with no extra
+setup — the values you **must** set in a real deployment are called out below.
+
+**Hostname note:** sample values use docker-compose service names (`postgres`,
+`kafka`, `mock-oidc`) reachable *inside* the compose network. Running a service
+outside compose, use `localhost` (the defaults) or your real hostnames.
+
+### Shared — `handler`, `dispatcher`, `worker`, `reaper`, `migrate`
+
+| Variable | Used by | Required? | Default | Sample | Secret? | What it does |
+|---|---|---|---|---|---|---|
+| `DATABASE_URL` | all | Prod: **yes** | `postgresql://app:app@localhost:5432/app` | `postgresql://app:<password>@postgres:5432/app` | **yes** (holds DB password) | Postgres DSN. Source of truth for jobs/outbox/config. |
+| `KAFKA_BOOTSTRAP_SERVERS` | dispatcher, worker | Prod: **yes** | `localhost:9092` | `kafka:9092` | no | Kafka broker list (comma-separated). |
+| `KAFKA_TOPIC` | dispatcher, worker | no | `jobs` | `jobs` | no | Topic the pointer envelope is published to / consumed from. Must match across dispatcher and worker. |
+| `CONSUMER_GROUP` | worker | no | `workers` | `workers` | no | Kafka consumer group. Keep **stable and shared** across all worker replicas so partitions load-balance instead of each worker reprocessing every message. |
+| `DISPATCHER_BATCH_SIZE` | dispatcher | no | `100` | `100` | no | Max outbox rows drained to Kafka per loop. |
+| `DISPATCHER_POLL_INTERVAL` | dispatcher | no | `1.0` | `1.0` | no | Seconds to sleep when the outbox is empty. |
+| `REAPER_POLL_INTERVAL` | reaper | no | `60.0` | `60.0` | no | Seconds between stuck-`running` sweeps. Run the reaper as a **single replica**. |
+
+The `handler` CLI takes its `job_type` and optional payload as command-line
+args (`python -m handler <job_type> [payload_json]`), not env vars. `handler`
+and `migrate` only use `DATABASE_URL`; `reaper` uses `DATABASE_URL` +
+`REAPER_POLL_INTERVAL` (no Kafka).
+
+### `handlerAPI` (also reads `DATABASE_URL` from the table above)
+
+| Variable | Required? | Default | Sample | Secret? | What it does |
+|---|---|---|---|---|---|
+| `OIDC_ISSUER` | **yes** | `http://mock-oidc:8080/default` | `https://ping.example.com/as` | no | Expected token `iss`; also used for JWKS discovery when `OIDC_JWKS_URL` is empty. Must exactly match the `iss` your IdP mints. |
+| `OIDC_AUDIENCE` | **yes** | `job-api` | `job-api` | no | Required token `aud`. |
+| `OIDC_JWKS_URL` | recommended | `` (derived from issuer) | `https://ping.example.com/as/jwks` | no | Signing-key endpoint. If empty, derived from the issuer's discovery document at startup. Set explicitly if the internal JWKS URL differs from the public issuer. |
+| `OIDC_CLOCK_SKEW_LEEWAY` | no | `60` | `60` | no | Seconds of tolerance on `exp`/`nbf`/`iat`. |
+| `OIDC_JWKS_CACHE_TTL` | no | `3600` | `3600` | no | Seconds to cache JWKS before refetch (keys still rotate by `kid` on miss). |
+| `SCOPE_WRITE` | no | `jobs.write` | `jobs.write` | no | Scope required for `POST /v1/jobs`. |
+| `SCOPE_READ` | no | `jobs.read` | `jobs.read` | no | Scope required for `GET /v1/jobs/{id}`. |
+| `SCOPE_READ_ALL` | no | `jobs.read.all` | `jobs.read.all` | no | Scope that lets a caller read jobs it didn't create. |
+| `OIDC_GROUPS_CLAIM` | no | `groups` | `groups` | no | Token claim carrying AD/role groups (captured on the principal for future group-based authz). |
+| `CORS_ALLOW_ORIGINS` | no | `` (none) | `https://app.example.com,https://admin.example.com` | no | Comma-separated allowed browser origins. Empty = no cross-origin browser access. |
+| `RATE_LIMIT` | no | `60/minute` | `120/minute` | no | In-app rate limit per caller (bearer, IP fallback). |
+| `RATE_LIMIT_ENABLED` | no | `true` | `true` | no | Toggle the in-app limiter (disable once a gateway/LB owns it). |
+| `HOST` | no | `0.0.0.0` | `0.0.0.0` | no | Bind address. |
+| `PORT` | no | `8080` | `8080` | no | Listen port. |
+| `TLS_CERTFILE` | only for in-app TLS | unset (plain HTTP) | `/run/secrets/tls/tls.crt` | no (path only) | Server cert path. Set both TLS vars to serve HTTPS in-app; leave unset when a gateway/LB terminates TLS. |
+| `TLS_KEYFILE` | only for in-app TLS | unset | `/run/secrets/tls/tls.key` | **yes** (mounted private key) | Server private-key path. Mount as a secret; never inline the key. |
+
+The M2M **client secret** is a *caller* credential (used by AutoSys to obtain a
+token) and lives in the caller's secret store — it is **not** an API-server env
+var. The API only ever validates the resulting bearer token.
 
 ## Run it (docker compose)
 
