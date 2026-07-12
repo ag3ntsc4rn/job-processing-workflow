@@ -53,8 +53,13 @@ identically:
 
 - **machine-to-machine** (AutoSys): `client_credentials` (client id + secret) —
   see [`scripts/enqueue_job.sh`](scripts/enqueue_job.sh);
-- **human / web app**: authorization-code + PKCE (the SPA obtains the token; the
-  full BFF login/logout flow is a later phase).
+- **human / web app**: authorization-code + PKCE. In the **target** design the
+  SPA never handles tokens — it holds only an httpOnly session cookie, and this
+  service (as the BFF) runs PKCE server-side, keeps the access/refresh tokens,
+  and attaches the bearer to downstream calls on the browser's behalf. Until
+  that BFF login/logout flow lands (a later phase), the SPA can do PKCE itself
+  and present the bearer directly; the endpoints don't change, only where the
+  token lives.
 
 The principal type (`user` vs `service`) is inferred from the claims, and the
 creator (`sub`/`type`/`client_id`) is persisted on the job (`created_by_*`).

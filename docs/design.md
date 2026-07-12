@@ -471,8 +471,12 @@ Both caller styles produce a token the API validates identically:
 
 - **M2M** (AutoSys): `client_credentials` (client id + secret). See
   `scripts/enqueue_job.sh`.
-- **Human / web app**: authorization-code + **PKCE** (the SPA does the exchange
-  for now; moving it server-side is the BFF phase).
+- **Human / web app**: authorization-code + **PKCE**. Target: the SPA holds only
+  an httpOnly session cookie and never sees tokens; this service (the BFF) does
+  the PKCE exchange server-side, stores the access/refresh tokens, and attaches
+  the bearer to downstream calls. Interim (until the BFF login/logout phase): the
+  SPA can run PKCE itself and send the bearer directly — same endpoints, only the
+  token's location changes.
 
 `user` vs `service` is inferred from claims (a user-identity claim like `email`,
 or `sub != client_id`). **Scopes are provisional and configurable**
