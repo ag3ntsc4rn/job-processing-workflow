@@ -1,0 +1,80 @@
+{
+  "realm": "jobs",
+  "enabled": true,
+  "accessTokenLifespan": 300,
+  "sslRequired": "none",
+  "clientScopes": [
+    {
+      "name": "jobs.read",
+      "description": "Read jobs via the handler API",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "jobs.write",
+      "description": "Enqueue jobs via the handler API",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "job-api-audience",
+      "description": "Stamps aud=job-api so the resource server accepts the token",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "job-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "job-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "job-api-v2-client",
+      "name": "handlerAPIv2 read+write service client (demo)",
+      "description": "M2M client_credentials client granted jobs.read + jobs.write.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "job-api-v2-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["jobs.read", "jobs.write", "job-api-audience"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "job-api-v2-reader",
+      "name": "handlerAPIv2 read-only service client (demo)",
+      "description": "M2M client granted only jobs.read — cannot enqueue, no matter what it requests.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "job-api-v2-reader-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["jobs.read", "job-api-audience"],
+      "optionalClientScopes": []
+    }
+  ]
+}

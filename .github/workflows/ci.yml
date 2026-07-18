@@ -123,7 +123,7 @@ jobs:
       - name: Apply migrations
         run: docker compose run --rm migrate
       - name: Build service images
-        run: docker compose build worker dispatcher handler handlerapi
+        run: docker compose build worker dispatcher handler handlerapi handlerapiv2
       - name: Start dispatcher + worker
         run: docker compose up -d dispatcher worker
       - name: Start API + mock OIDC
@@ -197,6 +197,50 @@ jobs:
           print("api ok: 401 -> 201 -> 200 -> 409")
           PY
           echo "value=401 -> 201 -> 200 -> 409" >> "$GITHUB_OUTPUT"
+      - name: Start handlerAPIv2 + Keycloak
+        run: docker compose up -d --wait handlerapiv2
+      - name: Wait for Keycloak realm to import
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8083/realms/jobs/.well-known/openid-configuration >/dev/null 2>&1; then
+              echo "keycloak ready after ${i}s"; exit 0
+            fi
+            sleep 2
+          done
+          echo "keycloak did not become ready"; docker compose logs keycloak; exit 1
+      - name: APIv2 - Keycloak token -> POST -> GET, with authn + authz
+        id: apiv2
+        run: |
+          docker compose exec -T handlerapiv2 python - <<'PY'
+          import httpx
+          base = "http://localhost:8080"
+          kc = "http://keycloak:8080/realms/jobs/protocol/openid-connect/token"
+
+          def token(client_id, secret):
+              r = httpx.post(kc, data={"grant_type": "client_credentials",
+                                       "client_id": client_id, "client_secret": secret})
+              r.raise_for_status()
+              return r.json()["access_token"]
+
+          # authn: no bearer -> 401
+          assert httpx.post(f"{base}/v1/jobs", json={"job_type": "reconcile"}).status_code == 401
+          # authz: read-only client cannot enqueue -> 403
+          ro = {"Authorization": f"Bearer {token('job-api-v2-reader', 'job-api-v2-reader-secret')}"}
+          assert httpx.post(f"{base}/v1/jobs", json={"job_type": "reconcile"}, headers=ro).status_code == 403
+          # read+write client: 201 -> 200 -> 409
+          rw = {"Authorization": f"Bearer {token('job-api-v2-client', 'job-api-v2-secret')}"}
+          r = httpx.post(f"{base}/v1/jobs", json={"job_type": "reconcile", "payload": {"region": "eu"}}, headers=rw)
+          assert r.status_code == 201, r.text
+          jid = r.json()["job_id"]
+          g = httpx.get(f"{base}/v1/jobs/{jid}", headers=rw).json()
+          assert g["input_payload"] == {"region": "eu"}, g
+          assert g["created_by"]["type"] == "service", g
+          # v2 reads are not ownership-gated: the read-only client can read it
+          assert httpx.get(f"{base}/v1/jobs/{jid}", headers=ro).status_code == 200
+          assert httpx.post(f"{base}/v1/jobs", json={"job_type": "reconcile"}, headers=rw).status_code == 409
+          print("apiv2 ok: 401 -> 403 -> 201 -> 200 -> 409")
+          PY
+          echo "value=401 -> 403 -> 201 -> 200 -> 409" >> "$GITHUB_OUTPUT"
       - name: E2E summary
         if: always()
         run: |
@@ -209,6 +253,7 @@ jobs:
             echo "| Pointer-only Kafka envelope | ${{ steps.envelope.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.envelope.outputs.value }}\` |"
             echo "| Missing config -> failed | ${{ steps.noconfig.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.noconfig.outputs.value }}\` |"
             echo "| API authz (401->201->200->409) | ${{ steps.api.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.api.outputs.value }}\` |"
+            echo "| APIv2 Keycloak authn+authz | ${{ steps.apiv2.outcome == 'success' && ':white_check_mark: pass' || ':x: fail' }} | \`${{ steps.apiv2.outputs.value }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Dump logs on failure
         if: failure()

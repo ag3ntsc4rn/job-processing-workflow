@@ -12,6 +12,7 @@ the source of truth, Kafka is transport. See
 | `common/` | shared contract | job model, statuses, message envelope, config, `Store` (Postgres + in-memory) |
 | `handler/` | producer | dedup-insert a job + outbox row in one transaction (AutoSys stand-in CLI) |
 | `handlerAPI/` | HTTP front door | long-running FastAPI service (OAuth2/OIDC resource server) that enqueues + looks up jobs over HTTP; reuses the same enqueue transaction |
+| `handlerAPIv2/` | gateway-fronted front door | same endpoints/schema as `handlerAPI`, but designed to sit **behind an Apigee proxy**: a plain JWT resource server (Keycloak in dev, Apigee-minted JWT in prod), machine-to-machine only, edge concerns delegated to the gateway. See [`handlerAPIv2/README.md`](handlerAPIv2/README.md) |
 | `dispatcher/` | dispatcher | drain the outbox to Kafka (`FOR UPDATE SKIP LOCKED`) |
 | `worker/` | worker | consume Kafka, claim (compare-and-set), resolve the effective payload (base config + input overrides), run the job-type handler |
 | `reaper/` | reaper | recover jobs stuck in `running` (per-type timeout + churn cap) |
@@ -94,6 +95,47 @@ Configuration is entirely env-driven; see the full
 [`handlerAPI/config.py`](handlerAPI/config.py). API deps live in
 `requirements-api.txt`.
 
+## HTTP API v2 (`handlerAPIv2/`)
+
+`handlerAPIv2/` is a second front door with the **same endpoints and the same
+Postgres schema** (no new migrations) but a different **trust model**: it is
+built to sit **behind an Apigee API gateway** and be a plain JWT resource server.
+Full details in [`handlerAPIv2/README.md`](handlerAPIv2/README.md); the essentials:
+
+- **Auth flow:** customer authenticates to **Keycloak** with client id + secret
+  (`client_credentials`) → receives a JWT (scopes + `aud=job-api`) → calls
+  **Apigee** with it → Apigee validates at the edge and forwards the request to
+  the service **with a JWT** (in the target design Apigee mints a fresh internal
+  token). The service just verifies the JWT (signature via JWKS + `iss`/`aud`/`exp`)
+  and the scope. *Who signs the token is pure config* — Keycloak in local dev,
+  Apigee in prod.
+- **Machine-to-machine only:** no human/PKCE, no per-user ownership. Every
+  principal is a `service`; any `jobs.read` holder can read any job. `created_by`
+  is still recorded.
+- **Scopes are admin-granted in Keycloak:** the realm admin attaches `jobs.read`
+  / `jobs.write` as client scopes when registering a customer's client; the
+  customer can't escalate beyond what was granted. `POST` needs `jobs.write`,
+  `GET` needs `jobs.read` (else `403`); an invalid/absent token is `401`.
+- **Edge concerns (TLS, CORS, rate limiting) are delegated to the gateway** and
+  are absent in-app.
+- **Store toggle:** in-memory by default; set `DATABASE_URL` and the
+  `PostgresStore` takes over unchanged.
+
+```bash
+docker compose up --build -d handlerapiv2   # also starts a real Keycloak with the `jobs` realm
+
+# mint a client-credentials token from Keycloak *inside* the compose network, then POST + GET:
+docker compose exec -T handlerapiv2 python - <<'PY'
+import httpx
+base, kc = "http://localhost:8080", "http://keycloak:8080/realms/jobs/protocol/openid-connect/token"
+tok = httpx.post(kc, data={"grant_type": "client_credentials",
+                           "client_id": "job-api-v2-client", "client_secret": "job-api-v2-secret"}).json()["access_token"]
+h = {"Authorization": f"Bearer {tok}"}
+r = httpx.post(f"{base}/v1/jobs", json={"job_type": "reconcile"}, headers=h)
+print(r.status_code, httpx.get(f"{base}{r.headers['Location']}", headers=h).json())
+PY
+```
+
 ## Configuration (environment variables)
 
 Every service reads config from the environment. `common/config.py` is shared by
@@ -147,6 +189,16 @@ and `migrate` only use `DATABASE_URL`; `reaper` uses `DATABASE_URL` +
 The M2M **client secret** is a *caller* credential (used by AutoSys to obtain a
 token) and lives in the caller's secret store — it is **not** an API-server env
 var. The API only ever validates the resulting bearer token.
+
+### `handlerAPIv2`
+
+Same OIDC/scope knobs (`OIDC_ISSUER`/`OIDC_AUDIENCE`/`OIDC_JWKS_URL`/
+`OIDC_CLOCK_SKEW_LEEWAY`/`OIDC_JWKS_CACHE_TTL`/`SCOPE_WRITE`/`SCOPE_READ`/`HOST`/
+`PORT`), minus the edge settings the gateway owns (`CORS_ALLOW_ORIGINS`,
+`RATE_LIMIT*`, `TLS_*`) and the human/ownership settings it doesn't use
+(`SCOPE_READ_ALL`, `OIDC_GROUPS_CLAIM`). Its `DATABASE_URL` is **optional**:
+unset → in-memory store, set → Postgres. Full table in
+[`handlerAPIv2/README.md`](handlerAPIv2/README.md).
 
 ## Run it (docker compose)
 

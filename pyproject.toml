@@ -9,12 +9,14 @@ select = ["E", "F", "I", "UP", "B"]
 # FastAPI's dependency-injection idiom relies on `Depends(...)` in defaults.
 "handlerAPI/routes.py" = ["B008"]
 "handlerAPI/deps.py" = ["B008"]
+"handlerAPIv2/routes.py" = ["B008"]
+"handlerAPIv2/deps.py" = ["B008"]
 
 [tool.pytest.ini_options]
 addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
 
 [tool.coverage.run]
-source = ["common", "handler", "handlerAPI", "dispatcher", "worker", "reaper"]
+source = ["common", "handler", "handlerAPI", "handlerAPIv2", "dispatcher", "worker", "reaper"]
 omit = [
     "*/__main__.py",
     "common/db.py",
