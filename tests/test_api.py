@@ -1,9 +1,10 @@
-"""HTTP tests: authn, authz (scopes), validation, dedup, hardening.
+"""HTTP tests: identity, authz (scopes), validation, dedup, hardening.
 
+Authentication (signature/issuer/audience/expiry) is owned by the upstream
+enterprise JWT auth middleware and is out of scope here; these tests exercise
+what this service actually does — read the validated claims and enforce scopes.
 v2 is machine-to-machine only: every caller is a service and reads are not
-ownership-gated, so any holder of ``jobs.read`` can read any job. Tokens are
-minted locally (see ``tests/conftest.py``) so the full JWT path runs with no
-live IdP.
+ownership-gated, so any holder of ``jobs.read`` can read any job.
 """
 
 from __future__ import annotations
@@ -11,31 +12,19 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app import create_app
-from auth.verifier import build_verifier
 from config import Settings
+from main import create_app
 from store.memory import InMemoryStore
-from tests.conftest import AUDIENCE, ISSUER, JWKS_URL, TokenFactory
+from tests.conftest import auth, make_token
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _svc_token(
-    tokens: TokenFactory, *, scope: str = "jobs.read jobs.write", sub: str = "svc"
-) -> str:
-    return tokens.mint(scope=scope, sub=sub, client_id="svc-app")
+def _svc_token(*, scope: str = "jobs.read jobs.write", sub: str = "svc") -> str:
+    return make_token(scope=scope, sub=sub, client_id="svc-app")
 
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(
-        database_url=None,
-        oidc_issuer=ISSUER,
-        oidc_audience=AUDIENCE,
-        oidc_jwks_url=JWKS_URL,
-    )
+    return Settings(database_url=None)
 
 
 @pytest.fixture
@@ -44,15 +33,14 @@ def store() -> InMemoryStore:
 
 
 @pytest.fixture
-def client(settings: Settings, store: InMemoryStore, tokens: TokenFactory) -> TestClient:
-    verifier = build_verifier(settings, http_get=tokens.http_get)
-    app = create_app(settings=settings, store=store, verifier=verifier)
+def client(settings: Settings, store: InMemoryStore) -> TestClient:
+    app = create_app(settings=settings, store=store)
     return TestClient(app)
 
 
-# --- authentication (authn) -------------------------------------------------
+# --- identity (claims present) ----------------------------------------------
 
-def test_post_requires_bearer(client: TestClient):
+def test_post_requires_authenticated_identity(client: TestClient):
     resp = client.post("/v1/jobs", json={"job_type": "hello"})
     assert resp.status_code == 401
     assert resp.headers["content-type"].startswith("application/problem+json")
@@ -60,106 +48,82 @@ def test_post_requires_bearer(client: TestClient):
 
 
 def test_post_rejects_malformed_token(client: TestClient):
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth("not-a-jwt"))
-    assert resp.status_code == 401
-
-
-def test_post_rejects_expired_token(client: TestClient, tokens: TokenFactory):
-    token = tokens.mint(exp_delta=-3600)
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
-    assert resp.status_code == 401
-
-
-def test_post_rejects_wrong_audience(client: TestClient, tokens: TokenFactory):
-    token = tokens.mint(audience="some-other-api")
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
-    assert resp.status_code == 401
-
-
-def test_post_rejects_wrong_issuer(client: TestClient, tokens: TokenFactory):
-    token = tokens.mint(issuer="https://evil.example.test")
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
-    assert resp.status_code == 401
-
-
-def test_post_rejects_unknown_kid(client: TestClient, tokens: TokenFactory):
-    token = tokens.mint(kid="no-such-key")
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
+    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth("not-a-jwt"))
     assert resp.status_code == 401
 
 
 # --- authorization (authz / scopes) -----------------------------------------
 
-def test_post_requires_write_scope(client: TestClient, tokens: TokenFactory):
-    token = _svc_token(tokens, scope="jobs.read")  # read-only client
-    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
+def test_post_requires_write_scope(client: TestClient):
+    token = _svc_token(scope="jobs.read")  # read-only client
+    resp = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth(token))
     assert resp.status_code == 403
 
 
-def test_get_requires_read_scope(client: TestClient, tokens: TokenFactory):
-    write = _svc_token(tokens, scope="jobs.write")
-    created = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(write))
+def test_get_requires_read_scope(client: TestClient):
+    write = _svc_token(scope="jobs.write")
+    created = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth(write))
     job_id = created.json()["job_id"]
-    resp = client.get(f"/v1/jobs/{job_id}", headers=_auth(write))
+    resp = client.get(f"/v1/jobs/{job_id}", headers=auth(write))
     assert resp.status_code == 403
 
 
 # --- create + dedup ---------------------------------------------------------
 
-def test_create_job_success_records_service_creator(client: TestClient, tokens: TokenFactory):
-    token = _svc_token(tokens)
+def test_create_job_success_records_service_creator(client: TestClient):
+    token = _svc_token()
     resp = client.post(
-        "/v1/jobs", json={"job_type": "hello", "payload": {"x": 1}}, headers=_auth(token)
+        "/v1/jobs", json={"job_type": "hello", "payload": {"x": 1}}, headers=auth(token)
     )
     assert resp.status_code == 201
     job_id = resp.json()["job_id"]
     assert resp.json()["status"] == "queued"
     assert resp.headers["Location"] == f"/v1/jobs/{job_id}"
 
-    got = client.get(f"/v1/jobs/{job_id}", headers=_auth(token)).json()
+    got = client.get(f"/v1/jobs/{job_id}", headers=auth(token)).json()
     assert got["input_payload"] == {"x": 1}
     assert got["created_by"] == {"sub": "svc", "type": "service", "client_id": "svc-app"}
 
 
-def test_create_job_dedup_conflict(client: TestClient, tokens: TokenFactory):
-    token = _svc_token(tokens)
-    first = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
+def test_create_job_dedup_conflict(client: TestClient):
+    token = _svc_token()
+    first = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth(token))
     assert first.status_code == 201
-    second = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(token))
+    second = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth(token))
     assert second.status_code == 409
 
 
 # --- validation -------------------------------------------------------------
 
-def test_create_job_rejects_bad_job_type(client: TestClient, tokens: TokenFactory):
+def test_create_job_rejects_bad_job_type(client: TestClient):
     resp = client.post(
-        "/v1/jobs", json={"job_type": "Bad Type!"}, headers=_auth(_svc_token(tokens))
+        "/v1/jobs", json={"job_type": "Bad Type!"}, headers=auth(_svc_token())
     )
     assert resp.status_code == 422
 
 
-def test_create_job_rejects_unknown_fields(client: TestClient, tokens: TokenFactory):
+def test_create_job_rejects_unknown_fields(client: TestClient):
     resp = client.post(
-        "/v1/jobs", json={"job_type": "hello", "bogus": 1}, headers=_auth(_svc_token(tokens))
+        "/v1/jobs", json={"job_type": "hello", "bogus": 1}, headers=auth(_svc_token())
     )
     assert resp.status_code == 422
 
 
 # --- reads (no ownership in v2) ---------------------------------------------
 
-def test_any_service_can_read_any_job(client: TestClient, tokens: TokenFactory):
-    creator = _svc_token(tokens, sub="svc-a")
-    created = client.post("/v1/jobs", json={"job_type": "hello"}, headers=_auth(creator))
+def test_any_service_can_read_any_job(client: TestClient):
+    creator = _svc_token(sub="svc-a")
+    created = client.post("/v1/jobs", json={"job_type": "hello"}, headers=auth(creator))
     job_id = created.json()["job_id"]
 
-    other = _svc_token(tokens, sub="svc-b")  # different principal, still 200 in v2
-    got = client.get(f"/v1/jobs/{job_id}", headers=_auth(other))
+    other = _svc_token(sub="svc-b")  # different principal, still 200 in v2
+    got = client.get(f"/v1/jobs/{job_id}", headers=auth(other))
     assert got.status_code == 200
     assert got.json()["created_by"]["type"] == "service"
 
 
-def test_get_missing_job_returns_404(client: TestClient, tokens: TokenFactory):
-    resp = client.get("/v1/jobs/999999", headers=_auth(_svc_token(tokens)))
+def test_get_missing_job_returns_404(client: TestClient):
+    resp = client.get("/v1/jobs/999999", headers=auth(_svc_token()))
     assert resp.status_code == 404
 
 
@@ -192,27 +156,25 @@ def test_unknown_path_returns_problem_404(client: TestClient):
     assert resp.headers["content-type"].startswith("application/problem+json")
 
 
-def test_readyz_reports_unavailable_when_store_down(settings, tokens: TokenFactory):
+def test_readyz_reports_unavailable_when_store_down(settings):
     class _BrokenStore(InMemoryStore):
         def get_job(self, job_id: int):
             raise RuntimeError("db down")
 
-    verifier = build_verifier(settings, http_get=tokens.http_get)
-    app = create_app(settings=settings, store=_BrokenStore(), verifier=verifier)
+    app = create_app(settings=settings, store=_BrokenStore())
     resp = TestClient(app).get("/readyz")
     assert resp.status_code == 503
 
 
-def test_internal_error_is_masked(settings, tokens: TokenFactory):
+def test_internal_error_is_masked(settings):
     class _ExplodingStore(InMemoryStore):
         def enqueue(self, *a, **k):
             raise RuntimeError("boom with secret db url")
 
-    verifier = build_verifier(settings, http_get=tokens.http_get)
-    app = create_app(settings=settings, store=_ExplodingStore(), verifier=verifier)
+    app = create_app(settings=settings, store=_ExplodingStore())
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.post(
-        "/v1/jobs", json={"job_type": "hello"}, headers=_auth(_svc_token(tokens))
+        "/v1/jobs", json={"job_type": "hello"}, headers=auth(_svc_token())
     )
     assert resp.status_code == 500
     assert "secret" not in resp.text
@@ -221,10 +183,9 @@ def test_internal_error_is_masked(settings, tokens: TokenFactory):
 
 # --- store selection --------------------------------------------------------
 
-def test_defaults_to_in_memory_store_when_no_database_url(settings, tokens: TokenFactory):
+def test_defaults_to_in_memory_store_when_no_database_url(settings):
     # No injected store + database_url is None -> lifespan builds InMemoryStore.
-    verifier = build_verifier(settings, http_get=tokens.http_get)
-    app = create_app(settings=settings, verifier=verifier)
+    app = create_app(settings=settings)
     with TestClient(app) as client:  # entering the context runs the lifespan
         assert client.get("/healthz").status_code == 200
         assert isinstance(app.state.store, InMemoryStore)

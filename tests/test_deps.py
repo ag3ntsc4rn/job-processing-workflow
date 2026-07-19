@@ -13,24 +13,16 @@ from fastapi.testclient import TestClient
 
 from api.deps import require_scope
 from auth.principal import Principal
-from auth.verifier import build_verifier
 from config import Settings
 from errors import register_error_handlers
-from tests.conftest import AUDIENCE, ISSUER, JWKS_URL, TokenFactory
+from tests.conftest import auth, make_token
 
 require_cancel = require_scope(lambda _s: "jobs.cancel")
 
 
-def _app(tokens: TokenFactory) -> FastAPI:
-    settings = Settings(
-        database_url=None,
-        oidc_issuer=ISSUER,
-        oidc_audience=AUDIENCE,
-        oidc_jwks_url=JWKS_URL,
-    )
+def _app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI()
-    app.state.settings = settings
-    app.state.verifier = build_verifier(settings, http_get=tokens.http_get)
+    app.state.settings = settings or Settings(database_url=None)
     register_error_handlers(app)
 
     @app.post("/v1/jobs/{job_id}/cancel")
@@ -40,39 +32,27 @@ def _app(tokens: TokenFactory) -> FastAPI:
     return app
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
-def test_require_scope_allows_when_scope_present(tokens: TokenFactory):
-    client = TestClient(_app(tokens))
-    token = tokens.mint(scope="jobs.read jobs.cancel")
-    resp = client.post("/v1/jobs/7/cancel", headers=_auth(token))
+def test_require_scope_allows_when_scope_present():
+    client = TestClient(_app())
+    token = make_token(scope="jobs.read jobs.cancel")
+    resp = client.post("/v1/jobs/7/cancel", headers=auth(token))
     assert resp.status_code == 200
     assert resp.json() == {"cancelled": "7"}
 
 
-def test_require_scope_forbids_when_scope_missing(tokens: TokenFactory):
-    client = TestClient(_app(tokens))
-    token = tokens.mint(scope="jobs.read jobs.write")  # no jobs.cancel
-    resp = client.post("/v1/jobs/7/cancel", headers=_auth(token))
+def test_require_scope_forbids_when_scope_missing():
+    client = TestClient(_app())
+    token = make_token(scope="jobs.read jobs.write")  # no jobs.cancel
+    resp = client.post("/v1/jobs/7/cancel", headers=auth(token))
     assert resp.status_code == 403
     assert "jobs.cancel" in resp.text
 
 
-def test_require_scope_selects_name_from_settings(tokens: TokenFactory):
+def test_require_scope_selects_name_from_settings():
     # A settings-driven selector resolves the scope string at request time.
     guard = require_scope(lambda s: s.scope_write)
     app = FastAPI()
-    settings = Settings(
-        database_url=None,
-        oidc_issuer=ISSUER,
-        oidc_audience=AUDIENCE,
-        oidc_jwks_url=JWKS_URL,
-        scope_write="jobs.admin",
-    )
-    app.state.settings = settings
-    app.state.verifier = build_verifier(settings, http_get=tokens.http_get)
+    app.state.settings = Settings(database_url=None, scope_write="jobs.admin")
     register_error_handlers(app)
 
     @app.get("/admin")
@@ -80,11 +60,11 @@ def test_require_scope_selects_name_from_settings(tokens: TokenFactory):
         return {"ok": True}
 
     client = TestClient(app)
-    assert client.get("/admin", headers=_auth(tokens.mint(scope="jobs.admin"))).status_code == 200
-    assert client.get("/admin", headers=_auth(tokens.mint(scope="jobs.read"))).status_code == 403
+    assert client.get("/admin", headers=auth(make_token(scope="jobs.admin"))).status_code == 200
+    assert client.get("/admin", headers=auth(make_token(scope="jobs.read"))).status_code == 403
 
 
-def test_store_dedup_returns_none_on_active(tokens: TokenFactory):
+def test_store_dedup_returns_none_on_active():
     from store.memory import InMemoryStore
 
     store = InMemoryStore()

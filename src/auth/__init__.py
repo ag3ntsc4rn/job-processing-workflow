@@ -1,1 +1,1 @@
-"""Authentication: JWT verification and the authenticated principal."""
+"""Authentication: the authenticated principal derived from validated claims."""

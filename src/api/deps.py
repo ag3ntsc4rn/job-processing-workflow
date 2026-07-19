@@ -1,9 +1,11 @@
 """FastAPI dependencies: settings, store, authenticated principal, scope guards.
 
-The store and token verifier are process singletons created in the app lifespan
-and stashed on ``app.state``; these dependencies read them from the request so
-routes stay thin and tests can swap them via ``app.dependency_overrides`` or by
-building the app with injected components.
+Authentication (signature / issuer / audience / expiry) is handled *upstream* by
+the enterprise JWT auth middleware (wired in ``main.py`` via
+``add_jwt_auth(app, exclude_routes=[...])``). By the time a request reaches a
+route, the token is already validated — so this module never verifies a token or
+touches JWKS/OIDC. It only reads the validated claims and enforces per-endpoint
+scope authorization, which the auth middleware does not do.
 
 **Adding an endpoint that needs a new scope** is two explicit steps, both in
 code — grant the scope to the client in your IdP, then guard the route here:
@@ -20,10 +22,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import jwt
 from fastapi import Depends, Request
 
 from auth.principal import Principal
-from auth.verifier import TokenVerifier
 from config import Settings
 from errors import ProblemException
 from store.base import Store
@@ -41,24 +43,36 @@ def get_store(request: Request) -> Store:
     return request.app.state.store
 
 
-def get_verifier(request: Request) -> TokenVerifier:
-    return request.app.state.verifier
+def _claims_from_request(request: Request) -> dict | None:
+    """Return the validated JWT claims for this request, or ``None`` if absent.
 
+    The enterprise auth middleware has already validated the token upstream, so
+    we decode the Bearer payload *without* re-verifying the signature (no JWKS,
+    no OIDC config needed) purely to read the claims.
 
-def get_principal(
-    request: Request,
-    verifier: TokenVerifier = Depends(get_verifier),
-) -> Principal:
+    If your middleware instead exposes the decoded claims directly, swap the body
+    for e.g. ``return getattr(request.state, "claims", None)``.
+    """
     header = request.headers.get("Authorization", "")
     scheme, _, token = header.partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
+        return None
+    try:
+        return jwt.decode(token.strip(), options={"verify_signature": False})
+    except jwt.PyJWTError:
+        return None
+
+
+def get_principal(request: Request) -> Principal:
+    claims = _claims_from_request(request)
+    if claims is None:
         raise ProblemException(
             401,
             "Unauthorized",
-            "missing bearer token",
+            "missing authenticated identity",
             headers=_BEARER_CHALLENGE,
         )
-    principal = verifier.verify(token.strip())
+    principal = Principal.from_claims(claims)
     request.state.principal = principal  # for logging / correlation
     return principal
 

@@ -1,9 +1,10 @@
 # job-api
 
 A small FastAPI service for enqueuing and reading jobs, built to run **behind an
-API gateway (Apigee)**. It is a plain JWT *resource server*: it validates the
-Bearer token it receives and enforces per-endpoint OAuth2 scopes. It is
-machine-to-machine only.
+API gateway (Apigee)**. The JWT is validated **upstream** by an enterprise JWT
+auth middleware (wired in `main.py` via `add_jwt_auth(app, exclude_routes=[...])`);
+this service reads the already-validated claims and enforces per-endpoint OAuth2
+scopes. It is machine-to-machine only.
 
 This is a standalone extraction of the `handlerAPIv2` component — it contains
 only the code, tests, and config for this one service (no Keycloak, no
@@ -26,25 +27,27 @@ Errors are RFC 7807 `application/problem+json`. Internal failures are masked as
 ```
 customer --(client_id/secret)--> IdP  ->  access token
 customer --(Bearer token)------> Apigee (validates, mints internal JWT)
-Apigee   --(Bearer JWT)--------> job-api (validates signature/iss/aud/exp + scope)
+Apigee   --(Bearer JWT)--------> JWT auth middleware (validates sig/iss/aud/exp)
+                                   -> job-api routes (read claims + enforce scope)
 ```
 
-The service does not care *who* signs the JWT — that is pure config
-(`OIDC_ISSUER` / `OIDC_JWKS_URL` / `OIDC_AUDIENCE`):
-
-- **local dev**: point it straight at your identity provider (no gateway).
-- **prod**: point it at Apigee's issuer/JWKS (Apigee mints the internal JWT).
+Token authentication (signature / `iss` / `aud` / `exp`) is handled by the
+enterprise **JWT auth middleware** mounted in `main.py`, so this service holds no
+OIDC/JWKS configuration. By the time a request reaches a route the token is
+already validated; the route only reads the claims and checks scopes.
 
 Edge concerns — TLS, CORS, rate limiting, quotas, spike arrest — are owned by the
 gateway and are deliberately not implemented here.
 
 ## Authentication vs authorization
 
-- **Authn** (is the token genuine?): signature verified against the issuer's
-  JWKS (cached, refreshed on rotation), plus `iss` / `aud` / `exp` / `nbf` with
-  clock-skew leeway. Failure → `401` with `WWW-Authenticate: Bearer`.
+- **Authn** (is the token genuine?): done **upstream** by the enterprise JWT auth
+  middleware — signature, `iss`, `aud`, `exp`. This service does not re-verify
+  it; it just requires validated claims to be present (a missing/unreadable
+  Bearer token → `401` with `WWW-Authenticate: Bearer`).
 - **Authz** (is the caller allowed here?): the required scope must be present in
-  the token's `scope` claim. Failure → `403`.
+  the token's `scope` claim. Failure → `403`. This is *not* something a generic
+  auth middleware does, so it lives here.
 
 ## Scopes and adding future endpoints
 
@@ -84,27 +87,36 @@ The app selects its store from `DATABASE_URL`:
 
 ```
 src/
-  app.py        FastAPI application factory
   config.py     Settings (from env)
   errors.py     RFC 7807 problem responses + handlers
-  main.py       uvicorn entrypoint
-  api/          routes, schemas, dependencies, middleware
-  auth/         JWT verifier + Principal
+  main.py       app factory (create_app + module-level `app`) + uvicorn entrypoint
+  api/          routes, schemas, dependencies (claim reading + scope guards), middleware
+  auth/         Principal (validated claims -> service identity)
   store/        Store protocol, in-memory + Postgres backends
   domain/       Job model, statuses, outbox envelope
-tests/          unit/integration tests (JWT path exercised with locally-minted keys)
+tests/          unit/integration tests (scopes/claims; auth middleware is out of scope)
 ```
+
+### Wiring the auth middleware
+
+`create_app` in `src/main.py` has a marked spot to mount your enterprise
+middleware, e.g.:
+
+```python
+from your_company.auth import add_jwt_auth
+add_jwt_auth(app, exclude_routes=["/healthz", "/readyz", "/docs", "/openapi.json"])
+```
+
+Routes read the validated claims via `get_principal` in `src/api/deps.py`. By
+default it decodes the Bearer payload (signature already verified upstream); if
+your middleware exposes decoded claims directly (e.g. `request.state.claims`),
+swap the one-line body of `_claims_from_request` to read from there.
 
 ## Configuration
 
 | Env var                 | Default       | Meaning                                             |
 |-------------------------|---------------|-----------------------------------------------------|
 | `DATABASE_URL`          | *(unset)*     | Unset → in-memory store; set → Postgres.            |
-| `OIDC_ISSUER`           | `""`          | Expected `iss`; signer of the JWT the service gets. |
-| `OIDC_AUDIENCE`         | `""`          | Expected `aud`.                                     |
-| `OIDC_JWKS_URL`         | `""`          | JWKS URL; empty → discovered from the issuer.       |
-| `OIDC_CLOCK_SKEW_LEEWAY`| `60`          | Seconds of leeway on `exp`/`nbf`/`iat`.             |
-| `OIDC_JWKS_CACHE_TTL`   | `3600`        | JWKS cache TTL (seconds).                           |
 | `SCOPE_WRITE`           | `jobs.write`  | Scope required by `POST /v1/jobs`.                  |
 | `SCOPE_READ`            | `jobs.read`   | Scope required by `GET /v1/jobs/{id}`.              |
 | `HOST` / `PORT`         | `0.0.0.0`/`8080` | Bind address.                                    |
@@ -121,30 +133,29 @@ pytest                # tests + coverage gate (--cov-fail-under=90)
 ```
 
 The editable install (`pip install -e .`) is what makes `import config`,
-`import api...`, and `uvicorn app:app` resolve from anywhere — no `PYTHONPATH`
+`import api...`, and `uvicorn main:app` resolve from anywhere — no `PYTHONPATH`
 needed. (Editors: `src` is declared as a source root via `[tool.pyright]` /
 `.vscode/settings.json`.)
 
-Run locally with your IdP config in the environment:
+Run locally — no OIDC config needed:
 
 ```bash
-OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... \
-  uvicorn app:app --host 0.0.0.0 --port 8080
+export PYTHONPATH=src
+cd src
+python -m uvicorn main:app --host 0.0.0.0 --port 8080
 
 # equivalently, honouring HOST/PORT from the env:
-OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... python -m main
+python -m main
 ```
 
-If you'd rather not install the package, put `src` on the path instead:
-`uvicorn app:app --app-dir src` (from the repo root) or `PYTHONPATH=src python -m main`.
+With the editable install you can also run `uvicorn main:app` from anywhere
+without `PYTHONPATH`.
 
 Or containerized:
 
 ```bash
 docker build -t job-api .
-docker run --rm -p 8080:8080 \
-  -e OIDC_ISSUER=... -e OIDC_AUDIENCE=... -e OIDC_JWKS_URL=... \
-  job-api
+docker run --rm -p 8080:8080 job-api
 ```
 
 ### Example requests

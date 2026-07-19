@@ -1,29 +1,26 @@
-"""Unit tests for the token verifier, principal derivation, and JWKS cache."""
+"""Unit tests for principal derivation from validated claims and claim reading.
+
+The token is validated upstream by the enterprise auth middleware; this service
+only turns the validated claims into a :class:`Principal` and reads scopes.
+"""
 
 from __future__ import annotations
 
 import pytest
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
 
-from auth.verifier import JwksCache, _extract_scopes, build_verifier
+from api.deps import get_principal
+from auth.principal import Principal, extract_scopes
 from config import Settings
-from errors import ProblemException
-from tests.conftest import ISSUER, JWKS_URL, KID, TokenFactory
+from errors import ProblemException, register_error_handlers
+from tests.conftest import auth, make_token
 
 
-def _verifier(tokens: TokenFactory) -> object:
-    settings = Settings(
-        database_url=None,
-        oidc_issuer=ISSUER,
-        oidc_audience="job-api",
-        oidc_jwks_url=JWKS_URL,
+def test_service_principal_from_client_credentials():
+    principal = Principal.from_claims(
+        {"sub": "svc", "client_id": "svc-app", "scope": "jobs.write jobs.read"}
     )
-    return build_verifier(settings, http_get=tokens.http_get)
-
-
-def test_service_principal_from_client_credentials(tokens: TokenFactory):
-    verifier = _verifier(tokens)
-    token = tokens.mint(sub="svc", client_id="svc-app", scope="jobs.write jobs.read")
-    principal = verifier.verify(token)
     assert principal.subject == "svc"
     assert principal.client_id == "svc-app"
     assert principal.has_scope("jobs.write")
@@ -31,41 +28,65 @@ def test_service_principal_from_client_credentials(tokens: TokenFactory):
     assert principal.to_creator().type == "service"
 
 
-def test_client_id_falls_back_to_azp(tokens: TokenFactory):
-    verifier = _verifier(tokens)
-    token = tokens.mint(sub="svc", extra={"azp": "gateway-app", "client_id": None})
-    principal = verifier.verify(token)
+def test_client_id_falls_back_to_azp():
+    principal = Principal.from_claims({"sub": "svc", "azp": "gateway-app"})
     assert principal.client_id == "gateway-app"
 
 
+def test_subject_falls_back_to_client_id_then_unknown():
+    assert Principal.from_claims({"client_id": "only-client"}).subject == "only-client"
+    assert Principal.from_claims({}).subject == "unknown"
+
+
 def test_extract_scopes_from_scope_string():
-    assert _extract_scopes({"scope": "a b c"}) == frozenset({"a", "b", "c"})
+    assert extract_scopes({"scope": "a b c"}) == frozenset({"a", "b", "c"})
 
 
 def test_extract_scopes_from_scp_list():
-    assert _extract_scopes({"scp": ["a", "b"]}) == frozenset({"a", "b"})
+    assert extract_scopes({"scp": ["a", "b"]}) == frozenset({"a", "b"})
 
 
 def test_extract_scopes_empty():
-    assert _extract_scopes({}) == frozenset()
+    assert extract_scopes({}) == frozenset()
 
 
-def test_jwks_cache_refreshes_and_rejects_unknown_kid(tokens: TokenFactory):
-    calls = {"n": 0}
+def _principal_app() -> FastAPI:
+    app = FastAPI()
+    app.state.settings = Settings(database_url=None)
+    register_error_handlers(app)
 
-    def counting_get(url: str):
-        calls["n"] += 1
-        return tokens.http_get(url)
+    @app.get("/whoami")
+    def whoami(principal: Principal = Depends(get_principal)) -> dict:
+        return {"sub": principal.subject, "scopes": sorted(principal.scopes)}
 
-    cache = JwksCache(JWKS_URL, http_get=counting_get, ttl=3600)
-    assert cache.get_key(KID) is not None
-    assert calls["n"] == 1
-    cache.get_key(KID)
-    assert calls["n"] == 1
+    return app
 
-    with pytest.raises(ProblemException):
-        cache.get_key("unknown-kid")
-    assert calls["n"] == 3
+
+def test_get_principal_reads_claims_from_bearer():
+    client = TestClient(_principal_app())
+    token = make_token(sub="svc-x", scope="jobs.read")
+    resp = client.get("/whoami", headers=auth(token))
+    assert resp.status_code == 200
+    assert resp.json() == {"sub": "svc-x", "scopes": ["jobs.read"]}
+
+
+def test_get_principal_401_without_bearer():
+    client = TestClient(_principal_app())
+    resp = client.get("/whoami")
+    assert resp.status_code == 401
+    assert resp.headers.get("www-authenticate") == "Bearer"
+
+
+def test_get_principal_401_on_malformed_token():
+    with pytest.raises(ProblemException) as exc:
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", b"Bearer not.a.jwt")],
+        }
+        get_principal(Request(scope))
+    assert exc.value.status_code == 401
 
 
 def test_from_env_store_toggle(monkeypatch):
