@@ -114,22 +114,29 @@ tests/          unit/integration tests (JWT path exercised with locally-minted k
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
+pip install -e .      # puts src/ on the import path (editable install)
 
 ruff check .          # lint
 pytest                # tests + coverage gate (--cov-fail-under=90)
 ```
 
-Run locally (with your IdP config in the environment). Because of the `src/`
-layout, `src` must be on the import path — use `--app-dir src` (or run from
-`src/`):
+The editable install (`pip install -e .`) is what makes `import config`,
+`import api...`, and `uvicorn app:app` resolve from anywhere — no `PYTHONPATH`
+needed. (Editors: `src` is declared as a source root via `[tool.pyright]` /
+`.vscode/settings.json`.)
+
+Run locally with your IdP config in the environment:
 
 ```bash
 OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... \
-  uvicorn app:app --app-dir src --host 0.0.0.0 --port 8080
+  uvicorn app:app --host 0.0.0.0 --port 8080
 
 # equivalently, honouring HOST/PORT from the env:
-PYTHONPATH=src OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... python -m main
+OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... python -m main
 ```
+
+If you'd rather not install the package, put `src` on the path instead:
+`uvicorn app:app --app-dir src` (from the repo root) or `PYTHONPATH=src python -m main`.
 
 Or containerized:
 
