@@ -119,9 +119,15 @@ ruff check .          # lint
 pytest                # tests + coverage gate (--cov-fail-under=90)
 ```
 
-Run locally (with your IdP config in the environment):
+Run locally (with your IdP config in the environment). Because of the `src/`
+layout, `src` must be on the import path — use `--app-dir src` (or run from
+`src/`):
 
 ```bash
+OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... \
+  uvicorn app:app --app-dir src --host 0.0.0.0 --port 8080
+
+# equivalently, honouring HOST/PORT from the env:
 PYTHONPATH=src OIDC_ISSUER=... OIDC_AUDIENCE=... OIDC_JWKS_URL=... python -m main
 ```
 

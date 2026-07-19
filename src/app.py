@@ -75,3 +75,10 @@ def create_app(
     register_error_handlers(app)
     app.include_router(router)
     return app
+
+
+# Module-level ASGI app for the common `uvicorn app:app` invocation. Building it
+# is cheap — settings are read from the environment and the store/JWKS are only
+# created when the lifespan runs — so importing this module has no side effects
+# beyond constructing the FastAPI object.
+app = create_app()
