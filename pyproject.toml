@@ -1,0 +1,33 @@
+[project]
+name = "job-api"
+version = "0.1.0"
+description = "Gateway-fronted JWT resource server for enqueuing and reading jobs."
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's dependency-injection idiom relies on `Depends(...)` in defaults.
+"src/api/routes.py" = ["B008"]
+"src/api/deps.py" = ["B008"]
+"tests/*" = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "src/main.py",
+    "src/store/postgres.py",
+]
+
+[tool.coverage.report]
+show_missing = true
