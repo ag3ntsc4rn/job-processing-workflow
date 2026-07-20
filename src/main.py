@@ -47,22 +47,26 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        created_store = False
+        # Only a store we create here is ours to close; an injected one is not.
+        owned_store: Store | None = None
         if injected_store is None:
             if settings.database_url:  # pragma: no cover - real DB path
                 from store.postgres import PostgresStore
 
-                app.state.store = PostgresStore(settings.database_url)
+                owned_store = PostgresStore(settings.database_url)
             else:
                 # Demo / no infra: process-local store. Same enqueue semantics;
                 # PostgresStore takes over untouched once DATABASE_URL is set.
-                app.state.store = InMemoryStore()
-            created_store = True
+                owned_store = InMemoryStore()
+            app.state.store = owned_store
         try:
             yield
         finally:
-            if created_store and hasattr(app.state.store, "close"):
-                app.state.store.close()
+            # close() is optional on the Store protocol (PostgresStore has it,
+            # InMemoryStore doesn't), so probe for it rather than assume.
+            close = getattr(owned_store, "close", None)
+            if callable(close):  # pragma: no cover - real DB path
+                close()
 
     app = FastAPI(
         title=settings.app_name,
