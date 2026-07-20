@@ -10,12 +10,10 @@
 ``python -m main`` also works and additionally honours ``HOST``/``PORT`` from the
 environment.
 
-**Auth** is chosen by ``AUTH_VERIFY``: on (default / prod) the app re-verifies
-the JWT signature + ``iss`` / ``aud`` / ``exp`` against the issuer's JWKS (a
-verifier is built at startup and stashed on ``app.state.verifier``); off (dev)
-skips verification and reads claims from the token payload so a developer can
-craft their own token. Either way routes enforce per-endpoint scopes (see
-``api/deps``).
+**Auth is upstream.** Token validation (signature / issuer / audience / expiry)
+is done by the enterprise JWT auth middleware — wire it in ``create_app`` at the
+marked spot with ``add_jwt_auth(app, exclude_routes=[...])``. The routes only
+read the validated claims and enforce scopes (see ``api/deps``).
 
 **Store selection** mirrors the demo-to-prod path: when ``settings.database_url``
 is unset the app runs on the process-local :class:`~store.memory.InMemoryStore`;
@@ -26,7 +24,6 @@ change. Edge concerns (rate limiting, CORS, TLS) are owned by the API gateway
 
 from __future__ import annotations
 
-import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -34,20 +31,16 @@ from fastapi import FastAPI
 
 from api.middleware import SecurityMiddleware
 from api.routes import router
-from auth.verifier import TokenVerifier, build_verifier
 from config import Settings
 from errors import register_error_handlers
 from store.base import Store
 from store.memory import InMemoryStore
-
-logger = logging.getLogger("job-api")
 
 
 def create_app(
     *,
     settings: Settings | None = None,
     store: Store | None = None,
-    verifier: TokenVerifier | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     injected_store = store
@@ -66,10 +59,6 @@ def create_app(
                 # PostgresStore takes over untouched once DATABASE_URL is set.
                 owned_store = InMemoryStore()
             app.state.store = owned_store
-        # Build the JWT verifier lazily at startup so importing this module has
-        # no side effects (no JWKS fetch / issuer discovery).
-        if settings.auth_verify and getattr(app.state, "verifier", None) is None:
-            app.state.verifier = build_verifier(settings)  # pragma: no cover - real IdP
         try:
             yield
         finally:
@@ -87,15 +76,12 @@ def create_app(
     app.state.settings = settings
     if store is not None:
         app.state.store = store
-    if verifier is not None:
-        app.state.verifier = verifier
 
-    if not settings.auth_verify:
-        logger.warning(
-            "AUTH_VERIFY is off: JWT signatures are NOT verified and claims are "
-            "read from the token payload. Use only in local development."
-        )
-
+    # --- Enterprise JWT auth middleware goes here (prod) ---
+    # The token is validated upstream; routes only read claims + enforce scopes.
+    #   from your_company.auth import add_jwt_auth
+    #   add_jwt_auth(app, exclude_routes=["/healthz", "/readyz", "/docs",
+    #                                     "/openapi.json"])
     app.add_middleware(SecurityMiddleware)
 
     register_error_handlers(app)

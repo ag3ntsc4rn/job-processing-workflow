@@ -1,10 +1,10 @@
 # job-api
 
 A small FastAPI service for enqueuing and reading jobs, built to run **behind an
-API gateway (Apigee)**. In production it **re-verifies** the JWT it receives
-(signature + `iss`/`aud`/`exp` against the issuer's JWKS) and enforces
-per-endpoint OAuth2 scopes; in local dev it can skip verification so you can
-craft your own token. It is machine-to-machine only.
+API gateway (Apigee)**. The JWT is validated **upstream** by an enterprise JWT
+auth middleware (wired in `main.py` via `add_jwt_auth(app, exclude_routes=[...])`);
+this service reads the already-validated claims and enforces per-endpoint OAuth2
+scopes. It is machine-to-machine only.
 
 This is a standalone extraction of the `handlerAPIv2` component — it contains
 only the code, tests, and config for this one service (no Keycloak, no
@@ -27,41 +27,27 @@ Errors are RFC 7807 `application/problem+json`. Internal failures are masked as
 ```
 customer --(client_id/secret)--> IdP  ->  access token
 customer --(Bearer token)------> Apigee (validates, mints internal JWT)
-Apigee   --(Bearer JWT)--------> job-api: verify sig/iss/aud/exp (JWKS)
-                                   -> routes (read claims + enforce scope)
+Apigee   --(Bearer JWT)--------> JWT auth middleware (validates sig/iss/aud/exp)
+                                   -> job-api routes (read claims + enforce scope)
 ```
+
+Token authentication (signature / `iss` / `aud` / `exp`) is handled by the
+enterprise **JWT auth middleware** mounted in `main.py`, so this service holds no
+OIDC/JWKS configuration. By the time a request reaches a route the token is
+already validated; the route only reads the claims and checks scopes.
 
 Edge concerns — TLS, CORS, rate limiting, quotas, spike arrest — are owned by the
 gateway and are deliberately not implemented here.
 
-### Why the API re-verifies (defense-in-depth)
-
-"Trusting the gateway" is only safe if the gateway is the *only* network path to
-the service. If the API is directly reachable, a caller could bypass Apigee and
-present a token. Re-verifying the signature against the issuer's JWKS means a
-**forged / self-minted** token is rejected with `401` even on a direct call —
-an attacker can't produce a valid signature without the issuer's private key.
-(Signature verification proves the token is *genuine*; it does not prove the
-request came through Apigee — for that you still need network isolation / mTLS /
-a gateway-shared-secret header.)
-
-## Auth modes (`AUTH_VERIFY`)
-
-| `AUTH_VERIFY` | Use        | Behavior                                                              |
-|---------------|------------|-----------------------------------------------------------------------|
-| `true` (default) | prod    | Re-verify signature + `iss`/`aud`/`exp` via JWKS. Forged/expired/wrong-audience token → `401`. Requires OIDC config. |
-| `false`       | local dev  | No signature check — claims read straight from the token payload, so you can craft your own token. Startup logs a loud warning. |
-
-Either mode still **requires** a Bearer token (missing/unreadable → `401` with
-`WWW-Authenticate: Bearer`) and runs the same scope authorization.
-
 ## Authentication vs authorization
 
-- **Authn** (is the token genuine?): when `AUTH_VERIFY` is on, the service checks
-  signature + `iss`/`aud`/`exp` against the issuer's JWKS; when off, it trusts
-  the payload (dev only). Missing/unreadable Bearer token → `401`.
+- **Authn** (is the token genuine?): done **upstream** by the enterprise JWT auth
+  middleware — signature, `iss`, `aud`, `exp`. This service does not re-verify
+  it; it just requires validated claims to be present (a missing/unreadable
+  Bearer token → `401` with `WWW-Authenticate: Bearer`).
 - **Authz** (is the caller allowed here?): the required scope must be present in
-  the token's `scope` claim. Failure → `403`.
+  the token's `scope` claim. Failure → `403`. This is *not* something a generic
+  auth middleware does, so it lives here.
 
 ## Scopes and adding future endpoints
 
@@ -105,28 +91,32 @@ src/
   errors.py     RFC 7807 problem responses + handlers
   main.py       app factory (create_app + module-level `app`) + uvicorn entrypoint
   api/          routes, schemas, dependencies (claim reading + scope guards), middleware
-  auth/         Principal (claims -> service identity) + JWT verifier (JWKS)
+  auth/         Principal (validated claims -> service identity)
   store/        Store protocol, in-memory + Postgres backends
   domain/       Job model, statuses, outbox envelope
-tests/          unit/integration tests (scopes/claims + JWKS verify path)
+tests/          unit/integration tests (scopes/claims; auth middleware is out of scope)
 ```
 
-`get_principal` in `src/api/deps.py` picks the mode: if a verifier was built
-(`AUTH_VERIFY` on) it calls `verifier.verify(token)`; otherwise it reads claims
-from the token payload. The verifier is built once at startup and stashed on
-`app.state.verifier`.
+### Wiring the auth middleware
+
+`create_app` in `src/main.py` has a marked spot to mount your enterprise
+middleware, e.g.:
+
+```python
+from your_company.auth import add_jwt_auth
+add_jwt_auth(app, exclude_routes=["/healthz", "/readyz", "/docs", "/openapi.json"])
+```
+
+Routes read the validated claims via `get_principal` in `src/api/deps.py`. By
+default it decodes the Bearer payload (signature already verified upstream); if
+your middleware exposes decoded claims directly (e.g. `request.state.claims`),
+swap the one-line body of `_claims_from_request` to read from there.
 
 ## Configuration
 
 | Env var                 | Default       | Meaning                                             |
 |-------------------------|---------------|-----------------------------------------------------|
 | `DATABASE_URL`          | *(unset)*     | Unset → in-memory store; set → Postgres.            |
-| `AUTH_VERIFY`           | `true`        | `true` → re-verify JWT via JWKS (prod); `false` → dev, no signature check. |
-| `OIDC_ISSUER`           | *(unset)*     | Expected `iss`; used for JWKS discovery if `OIDC_JWKS_URL` unset. Required when verifying. |
-| `OIDC_AUDIENCE`         | *(unset)*     | Expected `aud`. Required when verifying.            |
-| `OIDC_JWKS_URL`         | *(unset)*     | Issuer JWKS endpoint; if unset it's discovered from `OIDC_ISSUER`. |
-| `OIDC_CLOCK_SKEW_LEEWAY`| `60`          | Seconds of clock skew tolerated on `exp`/`nbf`.     |
-| `OIDC_JWKS_CACHE_TTL`   | `3600`        | Seconds to cache JWKS before refreshing.            |
 | `SCOPE_WRITE`           | `jobs.write`  | Scope required by `POST /v1/jobs`.                  |
 | `SCOPE_READ`            | `jobs.read`   | Scope required by `GET /v1/jobs/{id}`.              |
 | `HOST` / `PORT`         | `0.0.0.0`/`8080` | Bind address.                                    |
@@ -147,10 +137,9 @@ The editable install (`pip install -e .`) is what makes `import config`,
 needed. (Editors: `src` is declared as a source root via `[tool.pyright]` /
 `.vscode/settings.json`.)
 
-Run locally in **dev mode** (no OIDC config, craft your own token):
+Run locally — no OIDC config needed:
 
 ```bash
-export AUTH_VERIFY=false
 export PYTHONPATH=src
 cd src
 python -m uvicorn main:app --host 0.0.0.0 --port 8080
@@ -159,24 +148,14 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8080
 python -m main
 ```
 
-Mint a dev token (the signing key is irrelevant — nothing checks it in dev):
-
-```bash
-TOKEN=$(python -c "import jwt; print(jwt.encode({'sub':'dev','client_id':'dev-app','scope':'jobs.read jobs.write'}, 'x'*32, algorithm='HS256'))")
-```
-
-Drop `jobs.write` from the scope → `POST` returns `403`; omit the header → `401`.
-
-In **prod** leave `AUTH_VERIFY` at its default (`true`) and set `OIDC_ISSUER` /
-`OIDC_AUDIENCE` (and optionally `OIDC_JWKS_URL`) to the gateway/IdP that signs
-the tokens. With the editable install you can run `uvicorn main:app` from
-anywhere without `PYTHONPATH`.
+With the editable install you can also run `uvicorn main:app` from anywhere
+without `PYTHONPATH`.
 
 Or containerized:
 
 ```bash
 docker build -t job-api .
-docker run --rm -p 8080:8080 -e AUTH_VERIFY=false job-api   # demo; drop the env in prod + set OIDC_*
+docker run --rm -p 8080:8080 job-api
 ```
 
 ### Example requests

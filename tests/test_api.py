@@ -24,8 +24,7 @@ def _svc_token(*, scope: str = "jobs.read jobs.write", sub: str = "svc") -> str:
 
 @pytest.fixture
 def settings() -> Settings:
-    # dev mode: no signature verification, claims read from the token payload.
-    return Settings(database_url=None, auth_verify=False)
+    return Settings(database_url=None)
 
 
 @pytest.fixture

@@ -6,13 +6,14 @@ only turns the validated claims into a :class:`Principal` and reads scopes.
 
 from __future__ import annotations
 
+import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from api.deps import get_principal
 from auth.principal import Principal, extract_scopes
 from config import Settings
-from errors import register_error_handlers
+from errors import ProblemException, register_error_handlers
 from tests.conftest import auth, make_token
 
 
@@ -77,9 +78,15 @@ def test_get_principal_401_without_bearer():
 
 
 def test_get_principal_401_on_malformed_token():
-    client = TestClient(_principal_app())
-    resp = client.get("/whoami", headers=auth("not.a.jwt"))
-    assert resp.status_code == 401
+    with pytest.raises(ProblemException) as exc:
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", b"Bearer not.a.jwt")],
+        }
+        get_principal(Request(scope))
+    assert exc.value.status_code == 401
 
 
 def test_from_env_store_toggle(monkeypatch):
@@ -87,14 +94,3 @@ def test_from_env_store_toggle(monkeypatch):
     assert Settings.from_env().database_url is None
     monkeypatch.setenv("DATABASE_URL", "postgresql://app:app@db:5432/app")
     assert Settings.from_env().database_url == "postgresql://app:app@db:5432/app"
-
-
-def test_auth_verify_defaults_on_and_parses_env(monkeypatch):
-    monkeypatch.delenv("AUTH_VERIFY", raising=False)
-    assert Settings.from_env().auth_verify is True  # secure by default
-    for falsey in ("false", "0", "no", "off"):
-        monkeypatch.setenv("AUTH_VERIFY", falsey)
-        assert Settings.from_env().auth_verify is False
-    for truthy in ("true", "1", "yes", "on"):
-        monkeypatch.setenv("AUTH_VERIFY", truthy)
-        assert Settings.from_env().auth_verify is True
