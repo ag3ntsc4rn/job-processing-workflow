@@ -70,5 +70,7 @@ def test_store_dedup_returns_none_on_active():
     store = InMemoryStore()
     assert store.enqueue("hello") == 1
     assert store.enqueue("hello") is None  # active job of this type exists
-    assert store.get_job(1).job_type == "hello"
+    job = store.get_job(1)
+    assert job is not None
+    assert job.job_type == "hello"
     assert store.get_job(999) is None
