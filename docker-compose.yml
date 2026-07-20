@@ -122,6 +122,45 @@ services:
       OIDC_JWKS_URL: http://mock-oidc:8080/default/jwks
       RATE_LIMIT: 120/minute
 
+  # Real Keycloak issuer for handlerAPIv2 (the v2 local-dev IdP; stands in for
+  # the token source that, in prod, sits behind Apigee). Imports the `jobs`
+  # realm with M2M client_credentials clients + jobs.read/jobs.write scopes and
+  # an audience mapper (aud=job-api). Dev mode: the token issuer is derived from
+  # the request host, so tokens minted at `keycloak:8080` match the API's
+  # OIDC_ISSUER. NOT for production.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    ports:
+      - "8083:8080"
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+
+  # The v2 HTTP front door: a plain JWT resource server that sits behind an
+  # Apigee proxy in prod. Locally it validates Keycloak-issued tokens directly
+  # (no gateway in the loop). DATABASE_URL is set here, so the PostgresStore
+  # takes over; unset it and the same code falls back to the in-memory store.
+  handlerapiv2:
+    build:
+      context: .
+      dockerfile: handlerAPIv2/Dockerfile
+    ports:
+      - "8082:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/app
+      OIDC_ISSUER: http://keycloak:8080/realms/jobs
+      OIDC_AUDIENCE: job-api
+      OIDC_JWKS_URL: http://keycloak:8080/realms/jobs/protocol/openid-connect/certs
+
   # Producer stand-in for AutoSys. Run on demand:
   #   docker compose run --rm handler hello '{"name":"Ada"}'
   handler:
