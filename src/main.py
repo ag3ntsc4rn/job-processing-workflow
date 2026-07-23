@@ -51,9 +51,18 @@ def create_app(
         owned_store: Store | None = None
         if injected_store is None:
             if settings.database_url:  # pragma: no cover - real DB path
+                from store.circuit_breaker import CircuitBreaker, CircuitBreakerStore
                 from store.postgres import PostgresStore
 
-                owned_store = PostgresStore(settings.database_url)
+                # Guard the DB behind a circuit breaker so a sustained Postgres
+                # outage fails fast (503) instead of exhausting the pool.
+                owned_store = CircuitBreakerStore(
+                    PostgresStore(settings.database_url),
+                    CircuitBreaker(
+                        failure_threshold=settings.db_circuit_failure_threshold,
+                        reset_timeout=settings.db_circuit_reset_timeout,
+                    ),
+                )
             else:
                 # Demo / no infra: process-local store. Same enqueue semantics;
                 # PostgresStore takes over untouched once DATABASE_URL is set.

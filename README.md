@@ -83,6 +83,14 @@ The app selects its store from `DATABASE_URL`:
 - **set** → `PostgresStore` takes over with no code change; enqueue writes the
   job and its outbox row in one transaction against the shared schema.
 
+When Postgres is used it is wrapped in a **circuit breaker**
+(`store/circuit_breaker.py`). Connect-time retries tolerate a brief blip; the
+breaker handles a *sustained* outage: after `DB_CIRCUIT_FAILURE_THRESHOLD`
+consecutive failures it trips and, for `DB_CIRCUIT_RESET_TIMEOUT` seconds,
+rejects DB calls immediately with `503` (`Retry-After`) instead of piling up
+requests against a dead database and exhausting the pool. After the cooldown one
+trial call probes recovery and closes the breaker on success.
+
 ## Project layout
 
 ```
@@ -120,6 +128,8 @@ swap the one-line body of `_claims_from_request` to read from there.
 | `SCOPE_WRITE`           | `jobs.write`  | Scope required by `POST /v1/jobs`.                  |
 | `SCOPE_READ`            | `jobs.read`   | Scope required by `GET /v1/jobs/{id}`.              |
 | `HOST` / `PORT`         | `0.0.0.0`/`8080` | Bind address.                                    |
+| `DB_CIRCUIT_FAILURE_THRESHOLD` | `5`    | Consecutive DB failures before the breaker opens.  |
+| `DB_CIRCUIT_RESET_TIMEOUT`     | `30`   | Seconds the breaker stays open before a trial call.|
 
 ## Development
 
