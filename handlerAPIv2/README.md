@@ -98,6 +98,14 @@ the real `common.db.PostgresStore` takes over with **no code change** — the sa
 `Store` protocol, the same enqueue/dedup transaction. The docker-compose
 `handlerapiv2` service sets `DATABASE_URL`, so it uses Postgres out of the box.
 
+When Postgres is used it is wrapped in a **circuit breaker** (`pybreaker`, see
+`handlerAPIv2/circuit_breaker.py`). Connect-time retries tolerate a brief blip;
+the breaker handles a *sustained* outage: after `DB_CIRCUIT_FAILURE_THRESHOLD`
+consecutive failures it trips and, for `DB_CIRCUIT_RESET_TIMEOUT` seconds,
+rejects DB calls immediately with `503` (`Retry-After`) instead of piling up
+requests against a dead database and exhausting the pool. After the cooldown a
+trial call probes recovery and closes the breaker on success.
+
 ## Configuration (environment variables)
 
 | Variable | Required? | Default | What it does |
@@ -110,6 +118,8 @@ the real `common.db.PostgresStore` takes over with **no code change** — the sa
 | `OIDC_JWKS_CACHE_TTL` | no | `3600` | Seconds to cache JWKS before refetch (keys still rotate by `kid` on miss). |
 | `SCOPE_WRITE` | no | `jobs.write` | Scope required for `POST /v1/jobs`. |
 | `SCOPE_READ` | no | `jobs.read` | Scope required for `GET /v1/jobs/{id}`. |
+| `DB_CIRCUIT_FAILURE_THRESHOLD` | no | `5` | Consecutive DB failures before the breaker opens. |
+| `DB_CIRCUIT_RESET_TIMEOUT` | no | `30` | Seconds the breaker stays open before a trial call. |
 | `HOST` | no | `0.0.0.0` | Bind address. |
 | `PORT` | no | `8080` | Listen port. |
 

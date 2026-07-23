@@ -38,6 +38,11 @@ class Settings:
     scope_write: str = "jobs.write"
     scope_read: str = "jobs.read"
 
+    # Circuit breaker around the Postgres store: trip after this many consecutive
+    # failures, then fail fast for this many seconds before a half-open trial.
+    db_circuit_failure_threshold: int = 5
+    db_circuit_reset_timeout: float = 30.0
+
     # transport
     host: str = "0.0.0.0"  # noqa: S104 - bind all inside the container
     port: int = 8080
@@ -57,6 +62,12 @@ class Settings:
             jwks_cache_ttl=float(os.getenv("OIDC_JWKS_CACHE_TTL", "3600")),
             scope_write=os.getenv("SCOPE_WRITE", "jobs.write"),
             scope_read=os.getenv("SCOPE_READ", "jobs.read"),
+            db_circuit_failure_threshold=int(
+                os.getenv("DB_CIRCUIT_FAILURE_THRESHOLD", "5")
+            ),
+            db_circuit_reset_timeout=float(
+                os.getenv("DB_CIRCUIT_RESET_TIMEOUT", "30")
+            ),
             host=os.getenv("HOST", "0.0.0.0"),  # noqa: S104
             port=int(os.getenv("PORT", "8080")),
         )
