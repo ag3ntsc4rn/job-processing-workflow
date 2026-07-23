@@ -83,8 +83,8 @@ The app selects its store from `DATABASE_URL`:
 - **set** → `PostgresStore` takes over with no code change; enqueue writes the
   job and its outbox row in one transaction against the shared schema.
 
-When Postgres is used it is wrapped in a **circuit breaker**
-(`store/circuit_breaker.py`). Connect-time retries tolerate a brief blip; the
+When Postgres is used it is wrapped in a **circuit breaker** (`pybreaker`, see
+`store/circuit_breaker.py`). Connect-time retries tolerate a brief blip; the
 breaker handles a *sustained* outage: after `DB_CIRCUIT_FAILURE_THRESHOLD`
 consecutive failures it trips and, for `DB_CIRCUIT_RESET_TIMEOUT` seconds,
 rejects DB calls immediately with `503` (`Retry-After`) instead of piling up
