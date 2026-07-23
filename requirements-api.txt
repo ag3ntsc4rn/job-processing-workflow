@@ -5,3 +5,4 @@ uvicorn[standard]==0.32.0
 pyjwt[crypto]==2.13.0
 httpx==0.27.2
 limits==5.8.0
+pybreaker==1.4.1

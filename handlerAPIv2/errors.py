@@ -11,6 +11,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from handlerAPIv2.circuit_breaker import CircuitOpenError
+
 PROBLEM_MEDIA_TYPE = "application/problem+json"
 
 
@@ -65,6 +67,17 @@ def register_error_handlers(app: FastAPI) -> None:
         detail = exc.detail if isinstance(exc.detail, str) else None
         headers = getattr(exc, "headers", None)
         return _problem(exc.status_code, "HTTP error", detail, request, headers)
+
+    @app.exception_handler(CircuitOpenError)
+    async def _handle_circuit_open(request: Request, exc: CircuitOpenError) -> JSONResponse:
+        # Breaker is open: shed load fast instead of hitting a downed datastore.
+        return _problem(
+            503,
+            "Service Unavailable",
+            "datastore temporarily unavailable",
+            request,
+            {"Retry-After": "30"},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(
