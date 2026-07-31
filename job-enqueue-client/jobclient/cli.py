@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = JobClient(config).enqueue(args.job_type, payload)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return EXIT_USAGE
     except EnqueueError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_FAILED

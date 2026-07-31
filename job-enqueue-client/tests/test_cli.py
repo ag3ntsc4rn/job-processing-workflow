@@ -111,6 +111,19 @@ def test_success_without_job_id_still_reports(
     assert capsys.readouterr().out == "enqueued settlement (attempts: 2)\n"
 
 
+def test_empty_job_type_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real client rejects it; the CLI reports it instead of raising."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never called
+        raise AssertionError("no request expected")
+
+    monkeypatch.setattr(cli, "JobClient", lambda config: make_client(config, handler))
+    assert cli.main([""]) == 2
+    assert "job_type must be a non-empty string" in capsys.readouterr().err
+
+
 def test_missing_job_type_exits_two() -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.main([])

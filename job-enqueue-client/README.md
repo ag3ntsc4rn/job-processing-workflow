@@ -80,6 +80,10 @@ ruff check .
 pytest            # unit tests over an in-process transport; 90% coverage gate
 ```
 
+This directory is self-contained: copying it to the root of its own repo is the
+whole migration (GitHub only reads workflows from a repo root, so
+`.github/workflows/ci.yml` runs once this is a repo of its own).
+
 CI (`.github/workflows/ci.yml`) runs lint + tests with a coverage gate and PR
 comment, `pip-audit`, and a smoke job that drives the **real CLI over real HTTP**
 against `tests/stub_api.py` — asserting `201` then `409`, that the scopes reach
