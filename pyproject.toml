@@ -13,6 +13,8 @@ select = ["E", "F", "I", "UP", "B"]
 "handlerAPIv2/deps.py" = ["B008"]
 
 [tool.pytest.ini_options]
+# job-enqueue-client/ is a standalone project with its own suite and CI.
+testpaths = ["tests"]
 addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
 
 [tool.coverage.run]
