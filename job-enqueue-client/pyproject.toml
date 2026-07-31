@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["jobclient"]
+omit = ["tests/*"]
