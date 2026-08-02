@@ -17,6 +17,7 @@ the source of truth, Kafka is transport. See
 | `worker/` | worker | consume Kafka, claim (compare-and-set), resolve the effective payload (base config + input overrides), run the job-type handler |
 | `reaper/` | reaper | recover jobs stuck in `running` (per-type timeout + churn cap) |
 | `migrations/` | schema | idempotent DDL |
+| `deploy/standalone_pipeline_schema.sql` | schema | one-file DDL for the extracted [job-dispatcher](https://github.com/ag3ntsc4rn/job-dispatcher) + [job-worker](https://github.com/ag3ntsc4rn/job-worker) + [job-reaper](https://github.com/ag3ntsc4rn/job-reaper) services (subset of `migrations/`; not used by this repo) |
 
 **Adding a new job type is a worker-only change**: add a handler in
 `worker/handlers/` decorated with `@register("your_type")`, plus one
